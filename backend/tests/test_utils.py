@@ -1,5 +1,6 @@
 from agent.utils import (
     deduplicate_sources,
+    format_dimension_results,
     format_sources_for_research,
     render_source_citations,
     tavily_results_to_sources,
@@ -81,3 +82,29 @@ def test_sources_are_formatted_with_stable_ids():
     assert "[S0-0-0]" in rendered
     assert "Published: 2026-07-30" in rendered
     assert "Content: fact" in rendered
+
+
+def test_dimension_results_are_grouped_in_dimension_order():
+    results = [
+        {
+            "dimension": {"id": "1", "title": "Technology", "scope": "Tech"},
+            "research_content": "second",
+            "sources": [],
+            "research_loop_count": 2,
+            "is_sufficient": False,
+        },
+        {
+            "dimension": {"id": "0", "title": "Market", "scope": "Market"},
+            "research_content": "first",
+            "sources": [],
+            "research_loop_count": 1,
+            "is_sufficient": True,
+        },
+    ]
+
+    rendered = format_dimension_results(results)
+
+    assert rendered.index("Dimension 0: Market") < rendered.index(
+        "Dimension 1: Technology"
+    )
+    assert "loop limit reached after 2 loop(s)" in rendered

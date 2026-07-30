@@ -1,38 +1,16 @@
 from __future__ import annotations
 
 import operator
-from dataclasses import dataclass, field
 from typing import NotRequired, TypedDict
 
 from langgraph.graph import add_messages
 from typing_extensions import Annotated
 
 
-class OverallState(TypedDict):
-    messages: Annotated[list, add_messages]
-    search_query: Annotated[list, operator.add]
-    web_research_result: Annotated[list, operator.add]
-    sources_gathered: Annotated[list, operator.add]
-    initial_search_query_count: int
-    max_research_loops: int
-    research_loop_count: int
-    reasoning_model: str
-
-
-class ReflectionState(TypedDict):
-    is_sufficient: bool
-    knowledge_gap: str
-    follow_up_queries: Annotated[list, operator.add]
-    research_loop_count: int
-
-
-class QueryGenerationState(TypedDict):
-    search_query: list[str]
-
-
-class WebSearchState(TypedDict):
-    search_query: str
+class ResearchDimension(TypedDict):
     id: str
+    title: str
+    scope: str
 
 
 class ResearchSource(TypedDict):
@@ -45,6 +23,51 @@ class ResearchSource(TypedDict):
     published_date: NotRequired[str | None]
 
 
-@dataclass(kw_only=True)
-class SearchStateOutput:
-    running_summary: str = field(default=None)  # Final report
+class DimensionResult(TypedDict):
+    dimension: ResearchDimension
+    research_content: str
+    sources: list[ResearchSource]
+    research_loop_count: int
+    is_sufficient: bool
+
+
+class OverallState(TypedDict):
+    messages: Annotated[list, add_messages]
+    research_dimensions: list[ResearchDimension]
+    dimension_results: Annotated[list[DimensionResult], operator.add]
+    sources_gathered: Annotated[list[ResearchSource], operator.add]
+    initial_search_query_count: int
+    max_research_loops: int
+    reasoning_model: str
+
+
+class DimensionState(TypedDict):
+    research_topic: str
+    dimension: ResearchDimension
+    current_knowledge_gap: str
+    search_query: list[str]
+    web_research_result: Annotated[list[str], operator.add]
+    sources_gathered: Annotated[list[ResearchSource], operator.add]
+    initial_search_query_count: int
+    max_research_loops: int
+    research_loop_count: int
+    is_sufficient: bool
+
+
+class DimensionInput(TypedDict):
+    research_topic: str
+    dimension: ResearchDimension
+    initial_search_query_count: int
+    max_research_loops: int
+
+
+class QueryGenerationState(TypedDict):
+    research_topic: str
+    dimension: ResearchDimension
+    search_query: list[str]
+    research_loop_count: int
+
+
+class WebSearchState(TypedDict):
+    search_query: str
+    search_id: str

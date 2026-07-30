@@ -3,7 +3,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 
-from agent.state import ResearchSource
+from agent.state import DimensionResult, ResearchSource
 
 
 def get_research_topic(messages: list[AnyMessage]) -> str:
@@ -72,6 +72,24 @@ def deduplicate_sources(sources: list[ResearchSource]) -> list[ResearchSource]:
         seen_urls.add(source["url"])
         unique.append(source)
     return unique
+
+
+def format_dimension_results(results: list[DimensionResult]) -> str:
+    """Group independently gathered evidence by research dimension."""
+    if not results:
+        return "No dimension research was completed."
+
+    sections = []
+    for result in sorted(results, key=lambda item: int(item["dimension"]["id"])):
+        dimension = result["dimension"]
+        status = "sufficient" if result["is_sufficient"] else "loop limit reached"
+        sections.append(
+            f"## Dimension {dimension['id']}: {dimension['title']}\n"
+            f"Scope: {dimension['scope']}\n"
+            f"Research status: {status} after {result['research_loop_count']} loop(s)\n\n"
+            f"{result['research_content']}"
+        )
+    return "\n\n=====\n\n".join(sections)
 
 
 def render_source_citations(

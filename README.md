@@ -69,11 +69,16 @@ The core of the backend is a LangGraph agent defined in `backend/src/agent/graph
 
 <img src="./agent.png" title="Agent Flow" alt="Agent Flow" width="50%">
 
-1.  **Generate Initial Queries:** DeepSeek generates a bounded set of search queries.
-2.  **Web Research:** Tavily runs each query in parallel and returns relevant source snippets.
-3.  **Reflection & Knowledge Gap Analysis:** DeepSeek determines whether the evidence is sufficient and proposes bounded follow-up searches.
-4.  **Iterative Refinement:** If gaps are found or the information is insufficient, it generates follow-up queries and repeats the web research and reflection steps (up to a configured maximum number of loops).
-5.  **Finalize Answer:** DeepSeek synthesizes the gathered evidence using stable source markers, which the application validates and converts into Markdown citations.
+1.  **Plan Research Dimensions:** DeepSeek decomposes the main topic into distinct, complementary dimensions.
+2.  **Run Dimension Subgraphs:** One isolated LangGraph subgraph runs in parallel for every dimension.
+3.  **Generate Queries:** Each subgraph generates searches for its dimension and latest knowledge gap.
+4.  **Web Research:** Tavily runs the queries in parallel and returns relevant source snippets.
+5.  **Reflect and Refine:** DeepSeek evaluates each dimension independently. If evidence is insufficient, the knowledge gap returns to query generation for another loop.
+6.  **Finalize Answer:** DeepSeek synthesizes all completed dimensions using stable source markers, which the application validates and converts into Markdown citations.
+
+The parent graph defaults to three research dimensions. Override this with
+`NUMBER_OF_RESEARCH_DIMENSIONS` (between 2 and 8). Each dimension subgraph has
+its own query list, evidence, sources, reflection result, and loop counter.
 
 ## CLI Example
 

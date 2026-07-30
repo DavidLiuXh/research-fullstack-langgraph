@@ -29,7 +29,16 @@ export default function App() {
     messagesKey: "messages",
     onUpdateEvent: (event: any) => {
       let processedEvent: ProcessedEvent | null = null;
-      if (event.generate_query) {
+      if (event.generate_research_dimensions) {
+        const dimensions =
+          event.generate_research_dimensions?.research_dimensions || [];
+        processedEvent = {
+          title: "Planning Research Dimensions",
+          data:
+            dimensions.map((dimension: any) => dimension.title).join(", ") ||
+            "Research dimensions created",
+        };
+      } else if (event.generate_query) {
         processedEvent = {
           title: "Generating Search Queries",
           data: event.generate_query?.search_query?.join(", ") || "",
@@ -51,6 +60,12 @@ export default function App() {
         processedEvent = {
           title: "Reflection",
           data: "Analysing Web Research Results",
+        };
+      } else if (event.research_dimension) {
+        const result = event.research_dimension?.dimension_results?.[0];
+        processedEvent = {
+          title: "Dimension Research Complete",
+          data: result?.dimension?.title || "A research dimension was completed",
         };
       } else if (event.finalize_answer) {
         processedEvent = {

@@ -40,6 +40,8 @@ export function ActivityTimeline({
     }
     if (title.toLowerCase().includes("generating")) {
       return <TextSearch className="h-4 w-4 text-neutral-400" />;
+    } else if (title.toLowerCase().includes("dimension")) {
+      return <Brain className="h-4 w-4 text-neutral-400" />;
     } else if (title.toLowerCase().includes("thinking")) {
       return <Loader2 className="h-4 w-4 text-neutral-400 animate-spin" />;
     } else if (title.toLowerCase().includes("reflection")) {
