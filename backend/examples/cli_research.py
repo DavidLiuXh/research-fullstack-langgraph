@@ -21,7 +21,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--reasoning-model",
-        default="gemini-2.5-pro-preview-05-06",
+        default="deepseek-v4-pro",
         help="Model for the final answer",
     )
     args = parser.parse_args()
