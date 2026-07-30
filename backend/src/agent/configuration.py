@@ -1,29 +1,29 @@
 import os
-from pydantic import BaseModel, Field
-from typing import Any, Optional
+from typing import Any
 
 from langchain_core.runnables import RunnableConfig
+from pydantic import BaseModel, Field
 
 
 class Configuration(BaseModel):
     """The configuration for the agent."""
 
     query_generator_model: str = Field(
-        default="gemini-2.0-flash",
+        default="deepseek-v4-flash",
         metadata={
             "description": "The name of the language model to use for the agent's query generation."
         },
     )
 
     reflection_model: str = Field(
-        default="gemini-2.5-flash",
+        default="deepseek-v4-flash",
         metadata={
             "description": "The name of the language model to use for the agent's reflection."
         },
     )
 
     answer_model: str = Field(
-        default="gemini-2.5-pro",
+        default="deepseek-v4-pro",
         metadata={
             "description": "The name of the language model to use for the agent's answer."
         },
@@ -39,9 +39,28 @@ class Configuration(BaseModel):
         metadata={"description": "The maximum number of research loops to perform."},
     )
 
+    tavily_search_depth: str = Field(
+        default="advanced",
+        metadata={"description": "Tavily search depth: basic or advanced."},
+    )
+
+    tavily_max_results: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        metadata={"description": "Maximum Tavily results returned per query."},
+    )
+
+    max_follow_up_queries: int = Field(
+        default=3,
+        ge=1,
+        le=5,
+        metadata={"description": "Maximum follow-up searches scheduled per loop."},
+    )
+
     @classmethod
     def from_runnable_config(
-        cls, config: Optional[RunnableConfig] = None
+        cls, config: RunnableConfig | None = None
     ) -> "Configuration":
         """Create a Configuration instance from a RunnableConfig."""
         configurable = (

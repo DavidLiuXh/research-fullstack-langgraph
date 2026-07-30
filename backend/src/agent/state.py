@@ -1,13 +1,11 @@
 from __future__ import annotations
 
+import operator
 from dataclasses import dataclass, field
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 from langgraph.graph import add_messages
 from typing_extensions import Annotated
-
-
-import operator
 
 
 class OverallState(TypedDict):
@@ -26,21 +24,25 @@ class ReflectionState(TypedDict):
     knowledge_gap: str
     follow_up_queries: Annotated[list, operator.add]
     research_loop_count: int
-    number_of_ran_queries: int
-
-
-class Query(TypedDict):
-    query: str
-    rationale: str
 
 
 class QueryGenerationState(TypedDict):
-    search_query: list[Query]
+    search_query: list[str]
 
 
 class WebSearchState(TypedDict):
     search_query: str
     id: str
+
+
+class ResearchSource(TypedDict):
+    source_id: str
+    query: str
+    title: str
+    url: str
+    content: str
+    score: NotRequired[float | None]
+    published_date: NotRequired[str | None]
 
 
 @dataclass(kw_only=True)
