@@ -17,7 +17,7 @@ import {
 type MdComponentProps = {
   className?: string;
   children?: ReactNode;
-  [key: string]: any;
+  href?: string;
 };
 
 // Markdown components (from former ReportView.tsx)

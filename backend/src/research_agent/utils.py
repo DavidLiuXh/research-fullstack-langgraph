@@ -3,7 +3,7 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, AnyMessage, HumanMessage
 
-from agent.state import ResearchSource
+from research_agent.state import DimensionResult, ResearchSource
 
 
 def get_research_topic(messages: list[AnyMessage]) -> str:
@@ -21,7 +21,7 @@ def get_research_topic(messages: list[AnyMessage]) -> str:
 
 
 def tavily_results_to_sources(
-    response: dict[str, Any], query: str, search_id: str
+    response: dict[str, Any], query: str, search_id: str, research_run_id: str
 ) -> list[ResearchSource]:
     """Normalize a Tavily response into stable, prompt-safe research sources."""
     sources: list[ResearchSource] = []
@@ -32,6 +32,7 @@ def tavily_results_to_sources(
             continue
         sources.append(
             {
+                "research_run_id": research_run_id,
                 "source_id": f"S{search_id}-{index}",
                 "query": query,
                 "title": str(result.get("title") or url).strip(),
@@ -74,6 +75,24 @@ def deduplicate_sources(sources: list[ResearchSource]) -> list[ResearchSource]:
     return unique
 
 
+def format_dimension_results(results: list[DimensionResult]) -> str:
+    """Group independently gathered evidence by research dimension."""
+    if not results:
+        return "No dimension research was completed."
+
+    sections = []
+    for result in sorted(results, key=lambda item: int(item["dimension"]["id"])):
+        dimension = result["dimension"]
+        status = "sufficient" if result["is_sufficient"] else "loop limit reached"
+        sections.append(
+            f"## Dimension {dimension['id']}: {dimension['title']}\n"
+            f"Scope: {dimension['scope']}\n"
+            f"Research status: {status} after {result['research_loop_count']} loop(s)\n\n"
+            f"{result['research_content']}"
+        )
+    return "\n\n=====\n\n".join(sections)
+
+
 def render_source_citations(
     text: str, sources: list[ResearchSource]
 ) -> tuple[str, list[ResearchSource]]:
@@ -91,5 +110,5 @@ def render_source_citations(
         safe_title = source["title"].replace("[", "").replace("]", "")
         return f"[{safe_title}]({source['url']})"
 
-    rendered = re.sub(r"\[(S[0-9-]+)\]", replace, text)
+    rendered = re.sub(r"\[(S[A-Za-z0-9-]+)\]", replace, text)
     return rendered, [source_map[source_id] for source_id in used_ids]

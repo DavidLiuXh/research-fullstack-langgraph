@@ -42,8 +42,13 @@ Follow these steps to get the application running locally for development and te
 
 ```bash
 cd backend
-pip install .
+uv sync --group dev
 ```
+
+The Makefile explicitly places `backend/src` first on `PYTHONPATH` so the
+src-layout package is importable even when LangGraph CLI is installed globally.
+A project-local `uv` environment is still recommended for reproducible
+dependency versions.
 
 **Frontend:**
 
@@ -61,19 +66,32 @@ make dev
 ```
 This will run the backend and frontend development servers.    Open your browser and navigate to the frontend development server URL (e.g., `http://localhost:5173/app`).
 
-_Alternatively, you can run the backend and frontend development servers separately. For the backend, open a terminal in the `backend/` directory and run `langgraph dev`. The backend API will be available at `http://127.0.0.1:2024`. It will also open a browser window to the LangGraph UI. For the frontend, open a terminal in the `frontend/` directory and run `npm run dev`. The frontend will be available at `http://localhost:5173`._
+_Alternatively, run the servers separately. For the backend, open a terminal in
+`backend/` and run `PYTHONPATH=src langgraph dev`. The explicit `PYTHONPATH`
+ensures the src-layout package is available to a globally installed CLI.
+The backend API is available at
+`http://127.0.0.1:2024`. For the frontend, run `npm run dev` in `frontend/`._
 
 ## How the Backend Agent Works (High-Level)
 
-The core of the backend is a LangGraph agent defined in `backend/src/agent/graph.py`. It follows these steps:
+The core of the backend is a LangGraph agent defined in `backend/src/research_agent/graph.py`. It follows these steps:
 
 <img src="./agent.png" title="Agent Flow" alt="Agent Flow" width="50%">
 
-1.  **Generate Initial Queries:** DeepSeek generates a bounded set of search queries.
-2.  **Web Research:** Tavily runs each query in parallel and returns relevant source snippets.
-3.  **Reflection & Knowledge Gap Analysis:** DeepSeek determines whether the evidence is sufficient and proposes bounded follow-up searches.
-4.  **Iterative Refinement:** If gaps are found or the information is insufficient, it generates follow-up queries and repeats the web research and reflection steps (up to a configured maximum number of loops).
-5.  **Finalize Answer:** DeepSeek synthesizes the gathered evidence using stable source markers, which the application validates and converts into Markdown citations.
+1.  **Plan Research Dimensions:** DeepSeek decomposes the main topic into distinct, complementary dimensions.
+2.  **Run Dimension Subgraphs:** One isolated LangGraph subgraph runs in parallel for every dimension.
+3.  **Generate Queries:** Each subgraph generates searches for its dimension and latest knowledge gap.
+4.  **Web Research:** Tavily runs the queries in parallel and returns relevant source snippets.
+5.  **Reflect and Refine:** DeepSeek evaluates each dimension independently. If evidence is insufficient, the knowledge gap returns to query generation for another loop.
+6.  **Finalize Answer:** DeepSeek synthesizes all completed dimensions using stable source markers, which the application validates and converts into Markdown citations.
+
+The parent graph defaults to three research dimensions. Override this with
+`NUMBER_OF_RESEARCH_DIMENSIONS` (between 2 and 8). Each dimension subgraph has
+its own query list, evidence, sources, reflection result, and loop counter.
+Subgraph progress is emitted as custom LangGraph stream events so the frontend
+continues to show activity while dimensions run. Tavily searches retry twice by
+default and individual query failures degrade to partial research instead of
+aborting the whole graph.
 
 ## CLI Example
 
@@ -93,7 +111,9 @@ In production, the backend server serves the optimized static frontend build. La
 
 _Note: For the docker-compose.yml example you need a LangSmith API key, you can get one from [LangSmith](https://smith.langchain.com/settings)._
 
-_Note: If you are not running the docker-compose.yml example or exposing the backend server to the public internet, you should update the `apiUrl` in the `frontend/src/App.tsx` file to your host. Currently the `apiUrl` is set to `http://localhost:8123` for docker-compose or `http://localhost:2024` for development._
+_Note: Development connects to `http://localhost:2024` by default. Production
+uses the page origin. Set `VITE_LANGGRAPH_API_URL` at frontend build time when
+the API is hosted on a different origin._
 
 **1. Build the Docker Image:**
 

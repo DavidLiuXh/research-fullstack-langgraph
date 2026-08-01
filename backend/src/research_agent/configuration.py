@@ -10,52 +10,53 @@ class Configuration(BaseModel):
 
     query_generator_model: str = Field(
         default="deepseek-v4-flash",
-        metadata={
-            "description": "The name of the language model to use for the agent's query generation."
-        },
+        description="The model used for dimension planning and query generation.",
     )
 
     reflection_model: str = Field(
         default="deepseek-v4-flash",
-        metadata={
-            "description": "The name of the language model to use for the agent's reflection."
-        },
+        description="The model used to reflect on each research dimension.",
     )
 
     answer_model: str = Field(
         default="deepseek-v4-pro",
-        metadata={
-            "description": "The name of the language model to use for the agent's answer."
-        },
+        description="The model used to synthesize the final answer.",
     )
 
     number_of_initial_queries: int = Field(
         default=3,
-        metadata={"description": "The number of initial search queries to generate."},
+        description="The number of search queries generated per dimension loop.",
+    )
+
+    number_of_research_dimensions: int = Field(
+        default=3,
+        ge=2,
+        le=8,
+        description="Number of complementary research dimensions.",
     )
 
     max_research_loops: int = Field(
         default=2,
-        metadata={"description": "The maximum number of research loops to perform."},
+        description="Maximum research loops performed independently per dimension.",
     )
 
     tavily_search_depth: str = Field(
         default="advanced",
-        metadata={"description": "Tavily search depth: basic or advanced."},
+        description="Tavily search depth: basic or advanced.",
     )
 
     tavily_max_results: int = Field(
         default=5,
         ge=1,
         le=10,
-        metadata={"description": "Maximum Tavily results returned per query."},
+        description="Maximum Tavily results returned per query.",
     )
 
-    max_follow_up_queries: int = Field(
-        default=3,
-        ge=1,
+    tavily_max_retries: int = Field(
+        default=2,
+        ge=0,
         le=5,
-        metadata={"description": "Maximum follow-up searches scheduled per loop."},
+        description="Retries after the initial Tavily search attempt.",
     )
 
     @classmethod

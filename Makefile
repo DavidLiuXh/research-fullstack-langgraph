@@ -12,9 +12,9 @@ dev-frontend:
 
 dev-backend:
 	@echo "Starting backend development server..."
-	@cd backend && langgraph dev
+	@cd backend && PYTHONPATH=src langgraph dev
 
 # Run frontend and backend concurrently
 dev:
 	@echo "Starting both frontend and backend development servers..."
-	@make dev-frontend & make dev-backend 
+	@make dev-frontend & make dev-backend

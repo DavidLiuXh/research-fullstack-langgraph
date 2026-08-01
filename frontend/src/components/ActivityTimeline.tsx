@@ -20,7 +20,7 @@ import { useEffect, useState } from "react";
 
 export interface ProcessedEvent {
   title: string;
-  data: any;
+  data: unknown;
 }
 
 interface ActivityTimelineProps {
@@ -40,6 +40,8 @@ export function ActivityTimeline({
     }
     if (title.toLowerCase().includes("generating")) {
       return <TextSearch className="h-4 w-4 text-neutral-400" />;
+    } else if (title.toLowerCase().includes("dimension")) {
+      return <Brain className="h-4 w-4 text-neutral-400" />;
     } else if (title.toLowerCase().includes("thinking")) {
       return <Loader2 className="h-4 w-4 text-neutral-400 animate-spin" />;
     } else if (title.toLowerCase().includes("reflection")) {
@@ -110,7 +112,7 @@ export function ActivityTimeline({
                         {typeof eventItem.data === "string"
                           ? eventItem.data
                           : Array.isArray(eventItem.data)
-                          ? (eventItem.data as string[]).join(", ")
+                          ? eventItem.data.map(String).join(", ")
                           : JSON.stringify(eventItem.data)}
                       </p>
                     </div>

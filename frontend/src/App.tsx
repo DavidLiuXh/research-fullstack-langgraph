@@ -6,6 +6,44 @@ import { WelcomeScreen } from "@/components/WelcomeScreen";
 import { ChatMessagesView } from "@/components/ChatMessagesView";
 import { Button } from "@/components/ui/button";
 
+interface ResearchDimension {
+  id: string;
+  title: string;
+  scope: string;
+}
+
+interface ResearchSource {
+  title?: string;
+}
+
+interface DimensionResult {
+  dimension?: ResearchDimension;
+}
+
+interface GraphUpdateEvent {
+  generate_research_dimensions?: { research_dimensions?: ResearchDimension[] };
+  generate_query?: { search_query?: string[] };
+  web_research?: { sources_gathered?: ResearchSource[] };
+  reflection?: object;
+  research_dimension?: { dimension_results?: DimensionResult[] };
+  finalize_answer?: object;
+}
+
+interface ResearchCustomEvent {
+  type: string;
+  message?: string;
+  dimensions?: ResearchDimension[];
+  dimension?: ResearchDimension;
+  queries?: string[];
+  query?: string;
+  attempt?: number;
+  error?: string;
+  source_count?: number;
+  is_sufficient?: boolean;
+  knowledge_gap?: string;
+  loops?: number;
+}
+
 export default function App() {
   const [processedEventsTimeline, setProcessedEventsTimeline] = useState<
     ProcessedEvent[]
@@ -22,14 +60,23 @@ export default function App() {
     max_research_loops: number;
     reasoning_model: string;
   }>({
-    apiUrl: import.meta.env.DEV
-      ? "http://localhost:2024"
-      : "http://localhost:8123",
+    apiUrl:
+      import.meta.env.VITE_LANGGRAPH_API_URL ||
+      (import.meta.env.DEV ? "http://localhost:2024" : window.location.origin),
     assistantId: "agent",
     messagesKey: "messages",
-    onUpdateEvent: (event: any) => {
+    onUpdateEvent: (event: GraphUpdateEvent) => {
       let processedEvent: ProcessedEvent | null = null;
-      if (event.generate_query) {
+      if (event.generate_research_dimensions) {
+        const dimensions =
+          event.generate_research_dimensions?.research_dimensions || [];
+        processedEvent = {
+          title: "Planning Research Dimensions",
+          data:
+            dimensions.map((dimension) => dimension.title).join(", ") ||
+            "Research dimensions created",
+        };
+      } else if (event.generate_query) {
         processedEvent = {
           title: "Generating Search Queries",
           data: event.generate_query?.search_query?.join(", ") || "",
@@ -38,7 +85,7 @@ export default function App() {
         const sources = event.web_research.sources_gathered || [];
         const numSources = sources.length;
         const uniqueLabels = [
-          ...new Set(sources.map((s: any) => s.title).filter(Boolean)),
+          ...new Set(sources.map((source) => source.title).filter(Boolean)),
         ];
         const exampleLabels = uniqueLabels.slice(0, 3).join(", ");
         processedEvent = {
@@ -51,6 +98,12 @@ export default function App() {
         processedEvent = {
           title: "Reflection",
           data: "Analysing Web Research Results",
+        };
+      } else if (event.research_dimension) {
+        const result = event.research_dimension?.dimension_results?.[0];
+        processedEvent = {
+          title: "Dimension Research Complete",
+          data: result?.dimension?.title || "A research dimension was completed",
         };
       } else if (event.finalize_answer) {
         processedEvent = {
@@ -66,8 +119,82 @@ export default function App() {
         ]);
       }
     },
-    onError: (error: any) => {
-      setError(error.message);
+    onCustomEvent: (data: unknown) => {
+      if (!data || typeof data !== "object" || !("type" in data)) return;
+      const event = data as ResearchCustomEvent;
+      let processedEvent: ProcessedEvent | null = null;
+      switch (event.type) {
+        case "planning_dimensions":
+          processedEvent = {
+            title: "Planning Research Dimensions",
+            data: event.message,
+          };
+          break;
+        case "dimensions_created":
+          processedEvent = {
+            title: "Research Dimensions Created",
+            data: event.dimensions
+              ?.map((dimension) => dimension.title)
+              .join(", "),
+          };
+          break;
+        case "queries_generated":
+          processedEvent = {
+            title: `Generating Queries: ${event.dimension?.title || "Dimension"}`,
+            data: event.queries?.join(", ") || "",
+          };
+          break;
+        case "search_started":
+          processedEvent = { title: "Web Research", data: event.query };
+          break;
+        case "search_retrying":
+          processedEvent = {
+            title: "Retrying Web Research",
+            data: `${event.query} (attempt ${(event.attempt ?? 0) + 1})`,
+          };
+          break;
+        case "search_failed":
+          processedEvent = {
+            title: "Web Research Failed",
+            data: `${event.query}: ${event.error}`,
+          };
+          break;
+        case "search_completed":
+          processedEvent = {
+            title: "Web Research Complete",
+            data: `Gathered ${event.source_count} sources for ${event.query}`,
+          };
+          break;
+        case "reflection_completed":
+          processedEvent = {
+            title: `Reflection: ${event.dimension?.title || "Dimension"}`,
+            data: event.is_sufficient
+              ? "Evidence is sufficient"
+              : event.knowledge_gap,
+          };
+          break;
+        case "dimension_completed":
+          processedEvent = {
+            title: "Dimension Research Complete",
+            data: `${event.dimension?.title || "Dimension"} (${event.loops} loops)`,
+          };
+          break;
+        case "finalizing_answer":
+          processedEvent = {
+            title: "Finalizing Answer",
+            data: "Synthesizing all research dimensions.",
+          };
+          hasFinalizeEventOccurredRef.current = true;
+          break;
+      }
+      if (processedEvent) {
+        setProcessedEventsTimeline((previous) => [...previous, processedEvent!]);
+      }
+    },
+    onError: (streamError: unknown) => {
+      setError(
+        streamError instanceof Error ? streamError.message : String(streamError)
+      );
     },
   });
 
@@ -102,6 +229,7 @@ export default function App() {
   const handleSubmit = useCallback(
     (submittedInputValue: string, effort: string, model: string) => {
       if (!submittedInputValue.trim()) return;
+      setError(null);
       setProcessedEventsTimeline([]);
       hasFinalizeEventOccurredRef.current = false;
 
@@ -152,17 +280,11 @@ export default function App() {
   return (
     <div className="flex h-screen bg-neutral-800 text-neutral-100 font-sans antialiased">
       <main className="h-full w-full max-w-4xl mx-auto">
-          {thread.messages.length === 0 ? (
-            <WelcomeScreen
-              handleSubmit={handleSubmit}
-              isLoading={thread.isLoading}
-              onCancel={handleCancel}
-            />
-          ) : error ? (
+          {error ? (
             <div className="flex flex-col items-center justify-center h-full">
               <div className="flex flex-col items-center justify-center gap-4">
                 <h1 className="text-2xl text-red-400 font-bold">Error</h1>
-                <p className="text-red-400">{JSON.stringify(error)}</p>
+                <p className="text-red-400">{error}</p>
 
                 <Button
                   variant="destructive"
@@ -172,6 +294,12 @@ export default function App() {
                 </Button>
               </div>
             </div>
+          ) : thread.messages.length === 0 && !thread.isLoading ? (
+            <WelcomeScreen
+              handleSubmit={handleSubmit}
+              isLoading={thread.isLoading}
+              onCancel={handleCancel}
+            />
           ) : (
             <ChatMessagesView
               messages={thread.messages}
