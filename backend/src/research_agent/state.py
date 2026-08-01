@@ -14,6 +14,7 @@ class ResearchDimension(TypedDict):
 
 
 class ResearchSource(TypedDict):
+    research_run_id: str
     source_id: str
     query: str
     title: str
@@ -24,6 +25,7 @@ class ResearchSource(TypedDict):
 
 
 class DimensionResult(TypedDict):
+    research_run_id: str
     dimension: ResearchDimension
     research_content: str
     sources: list[ResearchSource]
@@ -34,6 +36,7 @@ class DimensionResult(TypedDict):
 class OverallState(TypedDict):
     messages: Annotated[list, add_messages]
     research_dimensions: list[ResearchDimension]
+    research_run_id: str
     dimension_results: Annotated[list[DimensionResult], operator.add]
     sources_gathered: Annotated[list[ResearchSource], operator.add]
     initial_search_query_count: int
@@ -42,6 +45,7 @@ class OverallState(TypedDict):
 
 
 class DimensionState(TypedDict):
+    research_run_id: str
     research_topic: str
     dimension: ResearchDimension
     current_knowledge_gap: str
@@ -55,6 +59,7 @@ class DimensionState(TypedDict):
 
 
 class DimensionInput(TypedDict):
+    research_run_id: str
     research_topic: str
     dimension: ResearchDimension
     initial_search_query_count: int
@@ -62,6 +67,7 @@ class DimensionInput(TypedDict):
 
 
 class QueryGenerationState(TypedDict):
+    research_run_id: str
     research_topic: str
     dimension: ResearchDimension
     search_query: list[str]
@@ -69,5 +75,6 @@ class QueryGenerationState(TypedDict):
 
 
 class WebSearchState(TypedDict):
+    research_run_id: str
     search_query: str
     search_id: str

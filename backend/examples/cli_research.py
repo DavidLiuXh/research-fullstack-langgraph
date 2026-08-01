@@ -1,6 +1,6 @@
 import argparse
 from langchain_core.messages import HumanMessage
-from agent.graph import graph
+from research_agent.graph import graph
 
 
 def main() -> None:

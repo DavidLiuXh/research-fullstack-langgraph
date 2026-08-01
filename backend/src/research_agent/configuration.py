@@ -52,6 +52,13 @@ class Configuration(BaseModel):
         description="Maximum Tavily results returned per query.",
     )
 
+    tavily_max_retries: int = Field(
+        default=2,
+        ge=0,
+        le=5,
+        description="Retries after the initial Tavily search attempt.",
+    )
+
     @classmethod
     def from_runnable_config(
         cls, config: RunnableConfig | None = None

@@ -1,4 +1,4 @@
-from agent.utils import (
+from research_agent.utils import (
     deduplicate_sources,
     format_dimension_results,
     format_sources_for_research,
@@ -20,11 +20,12 @@ def test_tavily_results_are_normalized_and_invalid_rows_are_skipped():
         ]
     }
 
-    sources = tavily_results_to_sources(response, "example query", "2-1")
+    sources = tavily_results_to_sources(response, "example query", "run-2-1", "run")
 
     assert sources == [
         {
-            "source_id": "S2-1-0",
+            "research_run_id": "run",
+            "source_id": "Srun-2-1-0",
             "query": "example query",
             "title": "Example",
             "url": "https://example.com/article",
@@ -37,6 +38,7 @@ def test_tavily_results_are_normalized_and_invalid_rows_are_skipped():
 
 def test_sources_are_deduplicated_by_url():
     first = {
+        "research_run_id": "run",
         "source_id": "S0-0-0",
         "query": "q1",
         "title": "First",
@@ -50,6 +52,7 @@ def test_sources_are_deduplicated_by_url():
 
 def test_only_known_source_markers_are_rendered():
     source = {
+        "research_run_id": "run",
         "source_id": "S0-0-0",
         "query": "q",
         "title": "Example [Site]",
@@ -69,6 +72,7 @@ def test_only_known_source_markers_are_rendered():
 
 def test_sources_are_formatted_with_stable_ids():
     source = {
+        "research_run_id": "run",
         "source_id": "S0-0-0",
         "query": "q",
         "title": "Example",
@@ -87,6 +91,7 @@ def test_sources_are_formatted_with_stable_ids():
 def test_dimension_results_are_grouped_in_dimension_order():
     results = [
         {
+            "research_run_id": "run",
             "dimension": {"id": "1", "title": "Technology", "scope": "Tech"},
             "research_content": "second",
             "sources": [],
@@ -94,6 +99,7 @@ def test_dimension_results_are_grouped_in_dimension_order():
             "is_sufficient": False,
         },
         {
+            "research_run_id": "run",
             "dimension": {"id": "0", "title": "Market", "scope": "Market"},
             "research_content": "first",
             "sources": [],

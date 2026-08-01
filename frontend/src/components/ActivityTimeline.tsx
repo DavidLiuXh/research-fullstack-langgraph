@@ -20,7 +20,7 @@ import { useEffect, useState } from "react";
 
 export interface ProcessedEvent {
   title: string;
-  data: any;
+  data: unknown;
 }
 
 interface ActivityTimelineProps {
@@ -112,7 +112,7 @@ export function ActivityTimeline({
                         {typeof eventItem.data === "string"
                           ? eventItem.data
                           : Array.isArray(eventItem.data)
-                          ? (eventItem.data as string[]).join(", ")
+                          ? eventItem.data.map(String).join(", ")
                           : JSON.stringify(eventItem.data)}
                       </p>
                     </div>
