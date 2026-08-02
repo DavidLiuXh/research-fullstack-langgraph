@@ -187,7 +187,7 @@ const AiMessageBubble: React.FC<AiMessageBubbleProps> = ({
   const isLiveActivityForThisBubble = isLastMessage && isOverallLoading;
 
   return (
-    <div className={`relative break-words flex flex-col`}>
+    <div className="relative flex w-full min-w-0 max-w-full flex-col overflow-hidden break-words [overflow-wrap:anywhere]">
       {activityForThisBubble && activityForThisBubble.length > 0 && (
         <div className="mb-3 border-b border-neutral-700 pb-3 text-xs">
           <ActivityTimeline
@@ -196,11 +196,13 @@ const AiMessageBubble: React.FC<AiMessageBubbleProps> = ({
           />
         </div>
       )}
-      <ReactMarkdown components={mdComponents}>
-        {typeof message.content === "string"
-          ? message.content
-          : JSON.stringify(message.content)}
-      </ReactMarkdown>
+      <div className="min-w-0 max-w-full">
+        <ReactMarkdown components={mdComponents}>
+          {typeof message.content === "string"
+            ? message.content
+            : JSON.stringify(message.content)}
+        </ReactMarkdown>
+      </div>
       <Button
         variant="default"
         className={`cursor-pointer bg-neutral-700 border-neutral-600 text-neutral-300 self-end ${
@@ -261,7 +263,7 @@ export function ChatMessagesView({
             return (
               <div key={message.id || `msg-${index}`} className="space-y-3">
                 <div
-                  className={`flex items-start gap-3 ${
+                  className={`flex min-w-0 max-w-full items-start gap-3 ${
                     message.type === "human" ? "justify-end" : ""
                   }`}
                 >

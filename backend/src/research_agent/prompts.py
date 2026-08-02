@@ -27,6 +27,12 @@ Example JSON:
 
 Research topic:
 {research_topic}
+
+Previous proposed dimensions:
+{previous_dimensions}
+
+Human feedback on the previous proposal:
+{human_feedback}
 """
 
 

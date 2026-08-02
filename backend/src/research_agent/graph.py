@@ -17,7 +17,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Send
+from langgraph.types import Send, interrupt
 from tavily import TavilyClient
 
 from research_agent.configuration import Configuration
@@ -64,6 +64,13 @@ def generate_research_dimensions(state: OverallState, config: RunnableConfig):
         current_date=get_current_date(),
         number_dimensions=configurable.number_of_research_dimensions,
         research_topic=topic,
+        previous_dimensions="\n".join(
+            f"- {item['title']}: {item['scope']}"
+            for item in state.get("research_dimensions", [])
+        )
+        or "None; this is the first proposal.",
+        human_feedback=state.get("dimension_feedback")
+        or "None; this is the first proposal.",
     )
     llm = create_deepseek_model(configurable.query_generator_model)
     result = llm.with_structured_output(
@@ -81,7 +88,44 @@ def generate_research_dimensions(state: OverallState, config: RunnableConfig):
     return {
         "research_run_id": research_run_id,
         "research_dimensions": dimensions,
+        "dimension_approved": False,
     }
+
+
+def review_research_dimensions(state: OverallState):
+    """Pause until a human approves the dimensions or supplies revision feedback."""
+    decision = interrupt(
+        {
+            "type": "research_dimension_review",
+            "research_run_id": state["research_run_id"],
+            "dimensions": state["research_dimensions"],
+            "message": "Review the proposed research dimensions before research begins.",
+        }
+    )
+    if not isinstance(decision, dict) or not isinstance(
+        decision.get("approved"), bool
+    ):
+        raise ValueError("Dimension review must include a boolean 'approved' value")
+
+    approved = decision["approved"]
+    feedback = str(decision.get("feedback", "")).strip()
+    if not approved and not feedback:
+        raise ValueError("Revision feedback is required when dimensions are rejected")
+
+    emit_research_event(
+        "dimensions_reviewed",
+        research_run_id=state["research_run_id"],
+        approved=approved,
+        feedback=feedback,
+    )
+    return {"dimension_approved": approved, "dimension_feedback": feedback}
+
+
+def route_dimension_review(state: OverallState):
+    """Regenerate rejected dimensions; dispatch approved dimensions for research."""
+    if not state["dimension_approved"]:
+        return "generate_research_dimensions"
+    return dispatch_research_dimensions(state)
 
 
 def dispatch_research_dimensions(state: OverallState):
@@ -340,13 +384,15 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
 
 builder = StateGraph(OverallState, config_schema=Configuration)
 builder.add_node("generate_research_dimensions", generate_research_dimensions)
+builder.add_node("review_research_dimensions", review_research_dimensions)
 builder.add_node("research_dimension", research_dimension)
 builder.add_node("finalize_answer", finalize_answer)
 builder.add_edge(START, "generate_research_dimensions")
+builder.add_edge("generate_research_dimensions", "review_research_dimensions")
 builder.add_conditional_edges(
-    "generate_research_dimensions",
-    dispatch_research_dimensions,
-    ["research_dimension"],
+    "review_research_dimensions",
+    route_dimension_review,
+    ["generate_research_dimensions", "research_dimension"],
 )
 builder.add_edge("research_dimension", "finalize_answer")
 builder.add_edge("finalize_answer", END)

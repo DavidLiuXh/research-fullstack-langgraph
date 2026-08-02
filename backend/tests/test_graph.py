@@ -8,6 +8,8 @@ from research_agent.graph import (
     dispatch_research_dimensions,
     finalize_answer,
     graph,
+    review_research_dimensions,
+    route_dimension_review,
     route_dimension_research,
     web_research,
 )
@@ -69,10 +71,65 @@ def test_parent_dispatches_isolated_dimension_inputs():
     assert sends[0].arg is not sends[1].arg
 
 
+def test_dimension_review_rejection_requires_regeneration(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+    monkeypatch.setattr(
+        graph_module,
+        "interrupt",
+        lambda value: {"approved": False, "feedback": "Add regulation"},
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+
+    result = review_research_dimensions(
+        {
+            "research_run_id": "run",
+            "research_dimensions": [
+                {"id": "0", "title": "Market", "scope": "market scope"}
+            ],
+        }
+    )
+
+    assert result == {
+        "dimension_approved": False,
+        "dimension_feedback": "Add regulation",
+    }
+    assert (
+        route_dimension_review({"dimension_approved": False})
+        == "generate_research_dimensions"
+    )
+
+
+def test_dimension_review_approval_dispatches_research(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+    monkeypatch.setattr(
+        graph_module,
+        "interrupt",
+        lambda value: {"approved": True, "feedback": ""},
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    state = {
+        "messages": [],
+        "research_run_id": "run",
+        "research_dimensions": [
+            {"id": "0", "title": "Market", "scope": "market scope"}
+        ],
+        "initial_search_query_count": 1,
+        "max_research_loops": 1,
+    }
+
+    result = review_research_dimensions(state)
+    routed = route_dimension_review({**state, **result})
+
+    assert result["dimension_approved"] is True
+    assert len(routed) == 1
+    assert routed[0].node == "research_dimension"
+
+
 def test_compiled_parent_graph_has_dimension_pipeline():
     assert graph.name == "deepseek-tavily-multidimensional-research-agent"
     assert {
         "generate_research_dimensions",
+        "review_research_dimensions",
         "research_dimension",
         "finalize_answer",
     }.issubset(graph.nodes)
@@ -131,6 +188,11 @@ def test_parent_graph_runs_parallel_dimension_subgraphs(monkeypatch):
         graph_module, "create_deepseek_model", lambda *a, **k: FakeModel()
     )
     monkeypatch.setattr(graph_module, "TavilyClient", FakeTavilyClient)
+    monkeypatch.setattr(
+        graph_module,
+        "interrupt",
+        lambda value: {"approved": True, "feedback": ""},
+    )
 
     graph_input = {
         "messages": [HumanMessage(content="Research this topic")],
@@ -153,6 +215,7 @@ def test_parent_graph_runs_parallel_dimension_subgraphs(monkeypatch):
     assert {
         "planning_dimensions",
         "dimensions_created",
+        "dimensions_reviewed",
         "queries_generated",
         "search_started",
         "search_completed",

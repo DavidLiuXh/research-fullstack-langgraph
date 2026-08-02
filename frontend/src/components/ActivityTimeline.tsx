@@ -16,7 +16,7 @@ import {
   ChevronDown,
   ChevronUp,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 export interface ProcessedEvent {
   title: string;
@@ -34,6 +34,7 @@ export function ActivityTimeline({
 }: ActivityTimelineProps) {
   const [isTimelineCollapsed, setIsTimelineCollapsed] =
     useState<boolean>(false);
+  const timelineScrollAreaRef = useRef<HTMLDivElement>(null);
   const getEventIcon = (title: string, index: number) => {
     if (index === 0 && isLoading && processedEvents.length === 0) {
       return <Loader2 className="h-4 w-4 text-neutral-400 animate-spin" />;
@@ -60,6 +61,19 @@ export function ActivityTimeline({
     }
   }, [isLoading, processedEvents]);
 
+  useEffect(() => {
+    if (isTimelineCollapsed) return;
+
+    const animationFrame = window.requestAnimationFrame(() => {
+      const viewport = timelineScrollAreaRef.current?.querySelector<HTMLElement>(
+        "[data-radix-scroll-area-viewport]"
+      );
+      viewport?.scrollTo({ top: viewport.scrollHeight, behavior: "smooth" });
+    });
+
+    return () => window.cancelAnimationFrame(animationFrame);
+  }, [processedEvents.length, isLoading, isTimelineCollapsed]);
+
   return (
     <Card className="border-none rounded-lg bg-neutral-700 max-h-96">
       <CardHeader>
@@ -78,7 +92,10 @@ export function ActivityTimeline({
         </CardDescription>
       </CardHeader>
       {!isTimelineCollapsed && (
-        <ScrollArea className="max-h-96 overflow-y-auto">
+        <ScrollArea
+          ref={timelineScrollAreaRef}
+          className="max-h-96 overflow-y-auto"
+        >
           <CardContent>
             {isLoading && processedEvents.length === 0 && (
               <div className="relative pl-8 pb-4">

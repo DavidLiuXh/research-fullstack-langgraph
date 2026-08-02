@@ -37,6 +37,8 @@ class OverallState(TypedDict):
     messages: Annotated[list, add_messages]
     research_dimensions: list[ResearchDimension]
     research_run_id: str
+    dimension_approved: bool
+    dimension_feedback: str
     dimension_results: Annotated[list[DimensionResult], operator.add]
     sources_gathered: Annotated[list[ResearchSource], operator.add]
     initial_search_query_count: int
