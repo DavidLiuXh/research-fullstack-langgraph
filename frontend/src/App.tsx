@@ -20,6 +20,20 @@ interface DimensionResult {
   dimension?: ResearchDimension;
 }
 
+interface ResearchState extends Record<string, unknown> {
+  messages: Message[];
+  initial_search_query_count: number;
+  max_research_loops: number;
+  reasoning_model: string;
+}
+
+interface DimensionReviewInterrupt {
+  type: "research_dimension_review";
+  research_run_id: string;
+  dimensions: ResearchDimension[];
+  message: string;
+}
+
 interface GraphUpdateEvent {
   generate_research_dimensions?: { research_dimensions?: ResearchDimension[] };
   generate_query?: { search_query?: string[] };
@@ -42,6 +56,8 @@ interface ResearchCustomEvent {
   is_sufficient?: boolean;
   knowledge_gap?: string;
   loops?: number;
+  approved?: boolean;
+  feedback?: string;
 }
 
 export default function App() {
@@ -54,12 +70,11 @@ export default function App() {
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const hasFinalizeEventOccurredRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
-  const thread = useStream<{
-    messages: Message[];
-    initial_search_query_count: number;
-    max_research_loops: number;
-    reasoning_model: string;
-  }>({
+  const [dimensionFeedback, setDimensionFeedback] = useState("");
+  const thread = useStream<
+    ResearchState,
+    { InterruptType: DimensionReviewInterrupt }
+  >({
     apiUrl:
       import.meta.env.VITE_LANGGRAPH_API_URL ||
       (import.meta.env.DEV ? "http://localhost:2024" : window.location.origin),
@@ -136,6 +151,14 @@ export default function App() {
             data: event.dimensions
               ?.map((dimension) => dimension.title)
               .join(", "),
+          };
+          break;
+        case "dimensions_reviewed":
+          processedEvent = {
+            title: event.approved
+              ? "Research Dimensions Approved"
+              : "Research Dimensions Rejected",
+            data: event.approved ? "Research can begin." : event.feedback,
           };
           break;
         case "queries_generated":
@@ -277,10 +300,35 @@ export default function App() {
     window.location.reload();
   }, [thread]);
 
+  const dimensionReview =
+    thread.interrupt?.value?.type === "research_dimension_review"
+      ? thread.interrupt.value
+      : null;
+
+  const handleDimensionApproval = useCallback(() => {
+    setError(null);
+    thread.submit(null, {
+      command: { resume: { approved: true, feedback: "" } },
+    });
+  }, [thread]);
+
+  const handleDimensionRevision = useCallback(() => {
+    const feedback = dimensionFeedback.trim();
+    if (!feedback) {
+      setError("Please explain how the research dimensions should be revised.");
+      return;
+    }
+    setError(null);
+    setDimensionFeedback("");
+    thread.submit(null, {
+      command: { resume: { approved: false, feedback } },
+    });
+  }, [dimensionFeedback, thread]);
+
   return (
     <div className="flex h-screen bg-neutral-800 text-neutral-100 font-sans antialiased">
       <main className="h-full w-full max-w-4xl mx-auto">
-          {error ? (
+          {error && !dimensionReview ? (
             <div className="flex flex-col items-center justify-center h-full">
               <div className="flex flex-col items-center justify-center gap-4">
                 <h1 className="text-2xl text-red-400 font-bold">Error</h1>
@@ -294,22 +342,81 @@ export default function App() {
                 </Button>
               </div>
             </div>
-          ) : thread.messages.length === 0 && !thread.isLoading ? (
+          ) : thread.messages.length === 0 &&
+            !thread.isLoading &&
+            !dimensionReview ? (
             <WelcomeScreen
               handleSubmit={handleSubmit}
               isLoading={thread.isLoading}
               onCancel={handleCancel}
             />
           ) : (
-            <ChatMessagesView
-              messages={thread.messages}
-              isLoading={thread.isLoading}
-              scrollAreaRef={scrollAreaRef}
-              onSubmit={handleSubmit}
-              onCancel={handleCancel}
-              liveActivityEvents={processedEventsTimeline}
-              historicalActivities={historicalActivities}
-            />
+            <div className="relative h-full">
+              <ChatMessagesView
+                messages={thread.messages}
+                isLoading={thread.isLoading}
+                scrollAreaRef={scrollAreaRef}
+                onSubmit={handleSubmit}
+                onCancel={handleCancel}
+                liveActivityEvents={processedEventsTimeline}
+                historicalActivities={historicalActivities}
+              />
+              {dimensionReview && (
+                <div className="absolute inset-0 z-20 flex items-center justify-center bg-neutral-950/80 p-4 backdrop-blur-sm">
+                  <section className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-xl border border-neutral-600 bg-neutral-800 p-6 shadow-2xl">
+                    <h2 className="text-xl font-semibold">
+                      Review Research Dimensions
+                    </h2>
+                    <p className="mt-2 text-sm text-neutral-300">
+                      {dimensionReview.message}
+                    </p>
+                    <div className="mt-5 space-y-3">
+                      {dimensionReview.dimensions.map((dimension) => (
+                        <div
+                          key={dimension.id}
+                          className="rounded-lg border border-neutral-600 bg-neutral-900 p-4"
+                        >
+                          <h3 className="font-medium text-neutral-100">
+                            {dimension.title}
+                          </h3>
+                          <p className="mt-1 text-sm text-neutral-300">
+                            {dimension.scope}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                    <label className="mt-5 block text-sm font-medium text-neutral-200">
+                      Revision feedback (required when rejecting)
+                    </label>
+                    <textarea
+                      value={dimensionFeedback}
+                      onChange={(event) => setDimensionFeedback(event.target.value)}
+                      placeholder="Describe missing perspectives, unwanted overlap, or a preferred focus..."
+                      className="mt-2 min-h-28 w-full resize-y rounded-lg border border-neutral-600 bg-neutral-900 p-3 text-sm outline-none focus:border-blue-400"
+                      disabled={thread.isLoading}
+                    />
+                    {error && <p className="mt-2 text-sm text-red-400">{error}</p>}
+                    <div className="mt-5 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
+                      <Button
+                        variant="outline"
+                        className="border-red-400/70 bg-red-950/40 text-red-100 hover:bg-red-900/70 hover:text-white"
+                        onClick={handleDimensionRevision}
+                        disabled={thread.isLoading}
+                      >
+                        Regenerate with Feedback
+                      </Button>
+                      <Button
+                        className="bg-emerald-600 text-white hover:bg-emerald-500"
+                        onClick={handleDimensionApproval}
+                        disabled={thread.isLoading}
+                      >
+                        Approve and Continue
+                      </Button>
+                    </div>
+                  </section>
+                </div>
+              )}
+            </div>
           )}
       </main>
     </div>

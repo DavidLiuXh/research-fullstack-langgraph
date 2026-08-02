@@ -88,6 +88,10 @@ The core of the backend is a LangGraph agent defined in `backend/src/research_ag
 The parent graph defaults to three research dimensions. Override this with
 `NUMBER_OF_RESEARCH_DIMENSIONS` (between 2 and 8). Each dimension subgraph has
 its own query list, evidence, sources, reflection result, and loop counter.
+After dimensions are proposed, the graph pauses for human review. Approving the
+proposal starts research; rejecting it requires feedback, which is combined
+with the previous proposal to regenerate the dimensions. This review loop
+continues until the proposal is approved.
 Subgraph progress is emitted as custom LangGraph stream events so the frontend
 continues to show activity while dimensions run. Tavily searches retry twice by
 default and individual query failures degrade to partial research instead of
