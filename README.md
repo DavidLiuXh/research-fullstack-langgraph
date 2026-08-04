@@ -21,8 +21,8 @@ research loop. This fork introduces the following changes:
 | --- | --- | --- |
 | LLM backend | Google Gemini | DeepSeek through its OpenAI-compatible API |
 | Web search | Google Search | Tavily Search |
-| Research planning | Generate queries directly from the question | Decompose the question into multiple complementary research dimensions |
-| Human control | No approval gate | Human-in-the-loop approval and feedback before research starts |
+| Research planning | Generate queries directly from the question | Clarify materially ambiguous topics, then decompose them into complementary research dimensions |
+| Human control | No approval gate | Human-in-the-loop topic clarification plus dimension approval and feedback loops |
 | Execution model | One research loop | One isolated subgraph per dimension, executed in parallel |
 | Reflection | Reflect on the overall search result | Reflect independently per dimension and return knowledge gaps to query generation |
 | Reliability | Search errors terminate the run | Tavily retries and individual-query failure degradation |
@@ -30,10 +30,10 @@ research loop. This fork introduces the following changes:
 | Result isolation | Shared accumulated state | Per-run IDs isolate sources and dimension results |
 | Browser continuity | In-memory frontend session | LangGraph thread ID persisted for page-reload recovery |
 
-Additional frontend improvements include a dimension review dialog, readable
-dark-theme approval controls, an auto-scrolling activity timeline, configurable
-API URL, explicit loading and error states, and safe wrapping for long report
-content.
+Additional frontend improvements include topic clarification and dimension
+review dialogs, readable dark-theme controls, an auto-scrolling activity
+timeline, configurable API URL, explicit loading and error states, and safe
+wrapping for long report content.
 
 ## Current Workflow
 
@@ -41,21 +41,29 @@ The backend graph is defined in
 [`backend/src/research_agent/graph.py`](backend/src/research_agent/graph.py).
 
 <p align="center">
-  <img src="./agent.png" title="Current research workflow" alt="Human-reviewed multidimensional research workflow" width="65%">
+  <img src="./agent.png" title="Current research workflow" alt="Topic clarification and human-reviewed multidimensional research workflow" width="65%">
 </p>
 
 ### Parent graph
 
-1. **Generate research dimensions.** DeepSeek decomposes the question into
-   distinct, complementary, independently researchable dimensions.
-2. **Human review.** LangGraph pauses with `interrupt()` and displays the
+1. **Analyze the research topic.** DeepSeek checks whether missing context or
+   material ambiguity could change the research plan or conclusions. Broad but
+   otherwise usable requests continue without unnecessary questions.
+2. **Clarify when necessary.** If the topic is unclear, LangGraph pauses with
+   `interrupt()` and the frontend displays the ambiguities, prioritized
+   questions, and suggested assumptions. The user can provide details and
+   trigger another analysis pass, or explicitly accept the assumptions. This
+   loop continues until the topic is clear enough to plan.
+3. **Generate research dimensions.** DeepSeek uses the normalized research brief
+   to create distinct, complementary, independently researchable dimensions.
+4. **Human review.** LangGraph pauses again and displays the
    proposed dimensions in the frontend.
-3. **Approve or revise.** Approval starts research. Rejection requires feedback;
+5. **Approve or revise.** Approval starts research. Rejection requires feedback;
    the previous proposal and feedback are sent back to dimension generation.
    This loop continues until the user approves the plan.
-4. **Parallel dimension research.** The parent graph dispatches one isolated
+6. **Parallel dimension research.** The parent graph dispatches one isolated
    subgraph for every approved dimension.
-5. **Synthesize the report.** Completed dimension results are filtered to the
+7. **Synthesize the report.** Completed dimension results are filtered to the
    current research run, merged, and converted into a cited final report.
 
 ### Dimension subgraph
@@ -83,6 +91,8 @@ dimension completion in real time.
   final synthesis.
 - Tavily Search with configurable depth, result limits, retries, and partial
   failure handling.
+- Material-ambiguity detection with iterative human clarification and optional
+  acceptance of suggested assumptions.
 - Human-in-the-loop research-plan approval with iterative feedback.
 - Parallel research across independently isolated dimensions.
 - Reflection-driven follow-up queries within each dimension.
