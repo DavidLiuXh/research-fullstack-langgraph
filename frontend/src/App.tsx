@@ -34,6 +34,15 @@ interface DimensionReviewInterrupt {
   message: string;
 }
 
+interface TopicClarificationInterrupt {
+  type: "research_topic_clarification";
+  message: string;
+  ambiguities: string[];
+  questions: string[];
+  assumptions: string[];
+  reason: string;
+}
+
 interface GraphUpdateEvent {
   generate_research_dimensions?: { research_dimensions?: ResearchDimension[] };
   generate_query?: { search_query?: string[] };
@@ -58,6 +67,12 @@ interface ResearchCustomEvent {
   loops?: number;
   approved?: boolean;
   feedback?: string;
+  needs_clarification?: boolean;
+  ambiguities?: string[];
+  questions?: string[];
+  assumptions?: string[];
+  action?: string;
+  response?: string;
 }
 
 const THREAD_STORAGE_KEY = "research-agent-thread-id";
@@ -73,6 +88,8 @@ export default function App() {
   const hasFinalizeEventOccurredRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [dimensionFeedback, setDimensionFeedback] = useState("");
+  const [topicClarificationResponse, setTopicClarificationResponse] =
+    useState("");
   const [threadId, setThreadId] = useState<string | null>(() =>
     window.localStorage.getItem(THREAD_STORAGE_KEY)
   );
@@ -81,7 +98,11 @@ export default function App() {
   );
   const thread = useStream<
     ResearchState,
-    { InterruptType: DimensionReviewInterrupt }
+    {
+      InterruptType:
+        | DimensionReviewInterrupt
+        | TopicClarificationInterrupt;
+    }
   >({
     apiUrl:
       import.meta.env.VITE_LANGGRAPH_API_URL ||
@@ -152,6 +173,23 @@ export default function App() {
       const event = data as ResearchCustomEvent;
       let processedEvent: ProcessedEvent | null = null;
       switch (event.type) {
+        case "topic_analyzed":
+          processedEvent = {
+            title: "Analyzing Research Topic",
+            data: event.needs_clarification
+              ? event.ambiguities?.join(", ")
+              : "The research topic is clear.",
+          };
+          break;
+        case "topic_clarification_received":
+          processedEvent = {
+            title: "Research Topic Clarified",
+            data:
+              event.action === "accept_assumptions"
+                ? "Accepted the proposed assumptions."
+                : event.response,
+          };
+          break;
         case "planning_dimensions":
           processedEvent = {
             title: "Planning Research Dimensions",
@@ -329,6 +367,7 @@ export default function App() {
     setIsRestoringThread(false);
     setError(null);
     setDimensionFeedback("");
+    setTopicClarificationResponse("");
     setProcessedEventsTimeline([]);
     setHistoricalActivities({});
     hasFinalizeEventOccurredRef.current = false;
@@ -338,6 +377,31 @@ export default function App() {
     thread.interrupt?.value?.type === "research_dimension_review"
       ? thread.interrupt.value
       : null;
+  const topicClarification =
+    thread.interrupt?.value?.type === "research_topic_clarification"
+      ? thread.interrupt.value
+      : null;
+
+  const handleTopicClarification = useCallback(() => {
+    const response = topicClarificationResponse.trim();
+    if (!response) {
+      setError("Please provide the requested clarification.");
+      return;
+    }
+    setError(null);
+    setTopicClarificationResponse("");
+    thread.submit(null, {
+      command: { resume: { action: "clarify", response } },
+    });
+  }, [thread, topicClarificationResponse]);
+
+  const handleAcceptTopicAssumptions = useCallback(() => {
+    setError(null);
+    setTopicClarificationResponse("");
+    thread.submit(null, {
+      command: { resume: { action: "accept_assumptions" } },
+    });
+  }, [thread]);
 
   const handleDimensionApproval = useCallback(() => {
     setError(null);
@@ -362,7 +426,7 @@ export default function App() {
   return (
     <div className="flex h-screen bg-neutral-800 text-neutral-100 font-sans antialiased">
       <main className="h-full w-full max-w-4xl mx-auto">
-          {error && !dimensionReview ? (
+          {error && !dimensionReview && !topicClarification ? (
             <div className="flex flex-col items-center justify-center h-full">
               <div className="flex flex-col items-center justify-center gap-4">
                 <h1 className="text-2xl text-red-400 font-bold">Error</h1>
@@ -382,7 +446,8 @@ export default function App() {
             </div>
           ) : thread.messages.length === 0 &&
             !thread.isLoading &&
-            !dimensionReview ? (
+            !dimensionReview &&
+            !topicClarification ? (
             <WelcomeScreen
               handleSubmit={handleSubmit}
               isLoading={thread.isLoading}
@@ -400,6 +465,89 @@ export default function App() {
                 liveActivityEvents={processedEventsTimeline}
                 historicalActivities={historicalActivities}
               />
+              {topicClarification && (
+                <div className="absolute inset-0 z-20 flex items-center justify-center bg-neutral-950/80 p-4 backdrop-blur-sm">
+                  <section className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-xl border border-neutral-600 bg-neutral-800 p-6 shadow-2xl">
+                    <h2 className="text-xl font-semibold">
+                      Clarify Research Topic
+                    </h2>
+                    <p className="mt-2 text-sm text-neutral-300">
+                      {topicClarification.message}
+                    </p>
+                    {topicClarification.reason && (
+                      <p className="mt-3 rounded-lg bg-neutral-900 p-3 text-sm text-neutral-300">
+                        {topicClarification.reason}
+                      </p>
+                    )}
+                    <div className="mt-5 space-y-4">
+                      <div>
+                        <h3 className="text-sm font-medium text-neutral-100">
+                          What needs clarification
+                        </h3>
+                        <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-neutral-300">
+                          {topicClarification.ambiguities.map((ambiguity) => (
+                            <li key={ambiguity}>{ambiguity}</li>
+                          ))}
+                        </ul>
+                      </div>
+                      <div>
+                        <h3 className="text-sm font-medium text-neutral-100">
+                          Questions
+                        </h3>
+                        <ol className="mt-2 list-decimal space-y-1 pl-5 text-sm text-neutral-300">
+                          {topicClarification.questions.map((question) => (
+                            <li key={question}>{question}</li>
+                          ))}
+                        </ol>
+                      </div>
+                      {topicClarification.assumptions.length > 0 && (
+                        <div>
+                          <h3 className="text-sm font-medium text-neutral-100">
+                            Suggested assumptions
+                          </h3>
+                          <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-neutral-300">
+                            {topicClarification.assumptions.map((assumption) => (
+                              <li key={assumption}>{assumption}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                    <label className="mt-5 block text-sm font-medium text-neutral-200">
+                      Your clarification
+                    </label>
+                    <textarea
+                      value={topicClarificationResponse}
+                      onChange={(event) =>
+                        setTopicClarificationResponse(event.target.value)
+                      }
+                      placeholder="Provide the missing scope, subject, or interpretation..."
+                      className="mt-2 min-h-28 w-full resize-y rounded-lg border border-neutral-600 bg-neutral-900 p-3 text-sm outline-none focus:border-blue-400"
+                      disabled={thread.isLoading}
+                    />
+                    {error && <p className="mt-2 text-sm text-red-400">{error}</p>}
+                    <div className="mt-5 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
+                      {topicClarification.assumptions.length > 0 && (
+                        <Button
+                          variant="outline"
+                          className="border-neutral-500 bg-neutral-700 text-neutral-100 hover:bg-neutral-600 hover:text-white"
+                          onClick={handleAcceptTopicAssumptions}
+                          disabled={thread.isLoading}
+                        >
+                          Continue with Assumptions
+                        </Button>
+                      )}
+                      <Button
+                        className="bg-blue-600 text-white hover:bg-blue-500"
+                        onClick={handleTopicClarification}
+                        disabled={thread.isLoading}
+                      >
+                        Submit Clarification
+                      </Button>
+                    </div>
+                  </section>
+                </div>
+              )}
               {dimensionReview && (
                 <div className="absolute inset-0 z-20 flex items-center justify-center bg-neutral-950/80 p-4 backdrop-blur-sm">
                   <section className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-xl border border-neutral-600 bg-neutral-800 p-6 shadow-2xl">

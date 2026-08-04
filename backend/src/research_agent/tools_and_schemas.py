@@ -1,6 +1,25 @@
 from pydantic import BaseModel, Field
 
 
+class TopicClarificationAssessment(BaseModel):
+    needs_clarification: bool = Field(
+        description="Whether material ambiguity prevents a reliable research plan."
+    )
+    ambiguities: list[str] = Field(
+        description="Material ambiguities or missing information that change the plan."
+    )
+    clarification_questions: list[str] = Field(
+        description="One to three prioritized questions for the user."
+    )
+    assumptions: list[str] = Field(
+        description="Reasonable defaults the user may accept instead of answering."
+    )
+    normalized_topic: str = Field(
+        description="A self-contained research brief using all known context and assumptions."
+    )
+    reason: str = Field(description="A concise explanation of the assessment.")
+
+
 class SearchQueryList(BaseModel):
     query: list[str] = Field(
         description="A list of search queries to be used for web research."

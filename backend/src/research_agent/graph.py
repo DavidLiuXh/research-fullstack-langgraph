@@ -28,6 +28,7 @@ from research_agent.prompts import (
     get_current_date,
     query_writer_instructions,
     reflection_instructions,
+    topic_clarification_instructions,
 )
 from research_agent.state import (
     DimensionInput,
@@ -36,7 +37,12 @@ from research_agent.state import (
     QueryGenerationState,
     WebSearchState,
 )
-from research_agent.tools_and_schemas import Reflection, ResearchDimensionList, SearchQueryList
+from research_agent.tools_and_schemas import (
+    Reflection,
+    ResearchDimensionList,
+    SearchQueryList,
+    TopicClarificationAssessment,
+)
 from research_agent.utils import (
     deduplicate_sources,
     format_dimension_results,
@@ -54,10 +60,124 @@ def emit_research_event(event_type: str, **data):
     get_stream_writer()({"type": event_type, **data})
 
 
+def initialize_research_topic(state: OverallState):
+    """Reset clarification state for the latest research request."""
+    topic = get_research_topic(state["messages"])
+    return {
+        "original_research_topic": topic,
+        "normalized_research_topic": topic,
+        "topic_needs_clarification": False,
+        "topic_ambiguities": [],
+        "topic_clarification_questions": [],
+        "topic_assumptions": [],
+        "topic_clarification_reason": "",
+        "topic_clarification_history": [],
+        "topic_clarification_action": "",
+    }
+
+
+def analyze_research_topic(state: OverallState, config: RunnableConfig):
+    """Decide whether material ambiguity requires human clarification."""
+    configurable = Configuration.from_runnable_config(config)
+    history = state.get("topic_clarification_history", [])
+    history_text = "\n\n".join(
+        "Questions:\n- "
+        + "\n- ".join(turn["questions"])
+        + f"\nUser response: {turn['response']}"
+        for turn in history
+    ) or "None; this is the first assessment."
+    prompt = topic_clarification_instructions.format(
+        original_topic=state["original_research_topic"],
+        clarification_history=history_text,
+    )
+    result = create_deepseek_model(
+        configurable.query_generator_model
+    ).with_structured_output(
+        TopicClarificationAssessment, method="json_mode"
+    ).invoke(prompt)
+    questions = result.clarification_questions[:3]
+    needs_clarification = result.needs_clarification and bool(questions)
+    emit_research_event(
+        "topic_analyzed",
+        needs_clarification=needs_clarification,
+        ambiguities=result.ambiguities,
+        questions=questions,
+        assumptions=result.assumptions,
+    )
+    return {
+        "normalized_research_topic": result.normalized_topic.strip()
+        or state["original_research_topic"],
+        "topic_needs_clarification": needs_clarification,
+        "topic_ambiguities": result.ambiguities,
+        "topic_clarification_questions": questions,
+        "topic_assumptions": result.assumptions,
+        "topic_clarification_reason": result.reason,
+        "topic_clarification_action": "",
+    }
+
+
+def route_topic_analysis(state: OverallState):
+    """Request clarification only when the topic has material ambiguity."""
+    if state["topic_needs_clarification"]:
+        return "request_topic_clarification"
+    return "generate_research_dimensions"
+
+
+def request_topic_clarification(state: OverallState):
+    """Pause for clarification or explicit acceptance of proposed assumptions."""
+    decision = interrupt(
+        {
+            "type": "research_topic_clarification",
+            "message": "Clarify the research topic before planning begins.",
+            "ambiguities": state["topic_ambiguities"],
+            "questions": state["topic_clarification_questions"],
+            "assumptions": state["topic_assumptions"],
+            "reason": state["topic_clarification_reason"],
+        }
+    )
+    if not isinstance(decision, dict):
+        raise ValueError("Topic clarification must be an object")
+    action = str(decision.get("action", "")).strip()
+    if action not in {"clarify", "accept_assumptions"}:
+        raise ValueError("Topic clarification action is invalid")
+
+    if action == "accept_assumptions":
+        response = "Accepted the proposed assumptions."
+        needs_clarification = False
+    else:
+        response = str(decision.get("response", "")).strip()
+        if not response:
+            raise ValueError("A clarification response is required")
+        needs_clarification = True
+
+    history = [
+        *state.get("topic_clarification_history", []),
+        {
+            "questions": state["topic_clarification_questions"],
+            "response": response,
+        },
+    ]
+    emit_research_event(
+        "topic_clarification_received", action=action, response=response
+    )
+    return {
+        "topic_clarification_action": action,
+        "topic_needs_clarification": needs_clarification,
+        "topic_clarification_history": history,
+    }
+
+
+def route_topic_clarification(state: OverallState):
+    """Reassess user input, or continue immediately with accepted assumptions."""
+    if state["topic_clarification_action"] == "accept_assumptions":
+        return "generate_research_dimensions"
+    return "analyze_research_topic"
+
+
 def generate_research_dimensions(state: OverallState, config: RunnableConfig):
     """Decompose the main topic into independent, complementary dimensions."""
     configurable = Configuration.from_runnable_config(config)
-    topic = get_research_topic(state["messages"])
+    topic = state["normalized_research_topic"]
     research_run_id = uuid4().hex[:12]
     emit_research_event("planning_dimensions", message="Planning research dimensions")
     prompt = dimension_instructions.format(
@@ -130,7 +250,7 @@ def route_dimension_review(state: OverallState):
 
 def dispatch_research_dimensions(state: OverallState):
     """Run one isolated research subgraph for each dimension in parallel."""
-    topic = get_research_topic(state["messages"])
+    topic = state["normalized_research_topic"]
     return [
         Send(
             "research_dimension",
@@ -374,7 +494,7 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
     emit_research_event("finalizing_answer", research_run_id=state["research_run_id"])
     prompt = answer_instructions.format(
         current_date=get_current_date(),
-        research_topic=get_research_topic(state["messages"]),
+        research_topic=state["normalized_research_topic"],
         dimension_research=format_dimension_results(current_results),
     )
     result = create_deepseek_model(model, thinking=True).invoke(prompt)
@@ -383,11 +503,25 @@ def finalize_answer(state: OverallState, config: RunnableConfig):
 
 
 builder = StateGraph(OverallState, config_schema=Configuration)
+builder.add_node("initialize_research_topic", initialize_research_topic)
+builder.add_node("analyze_research_topic", analyze_research_topic)
+builder.add_node("request_topic_clarification", request_topic_clarification)
 builder.add_node("generate_research_dimensions", generate_research_dimensions)
 builder.add_node("review_research_dimensions", review_research_dimensions)
 builder.add_node("research_dimension", research_dimension)
 builder.add_node("finalize_answer", finalize_answer)
-builder.add_edge(START, "generate_research_dimensions")
+builder.add_edge(START, "initialize_research_topic")
+builder.add_edge("initialize_research_topic", "analyze_research_topic")
+builder.add_conditional_edges(
+    "analyze_research_topic",
+    route_topic_analysis,
+    ["request_topic_clarification", "generate_research_dimensions"],
+)
+builder.add_conditional_edges(
+    "request_topic_clarification",
+    route_topic_clarification,
+    ["analyze_research_topic", "generate_research_dimensions"],
+)
 builder.add_edge("generate_research_dimensions", "review_research_dimensions")
 builder.add_conditional_edges(
     "review_research_dimensions",
