@@ -230,6 +230,7 @@ interface ChatMessagesViewProps {
   scrollAreaRef: React.RefObject<HTMLDivElement | null>;
   onSubmit: (inputValue: string, effort: string, model: string) => void;
   onCancel: () => void;
+  onNewSearch: () => void;
   liveActivityEvents: ProcessedEvent[];
   historicalActivities: Record<string, ProcessedEvent[]>;
 }
@@ -240,6 +241,7 @@ export function ChatMessagesView({
   scrollAreaRef,
   onSubmit,
   onCancel,
+  onNewSearch,
   liveActivityEvents,
   historicalActivities,
 }: ChatMessagesViewProps) {
@@ -317,6 +319,7 @@ export function ChatMessagesView({
         onSubmit={onSubmit}
         isLoading={isLoading}
         onCancel={onCancel}
+        onNewSearch={onNewSearch}
         hasHistory={messages.length > 0}
       />
     </div>

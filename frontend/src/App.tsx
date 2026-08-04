@@ -60,6 +60,8 @@ interface ResearchCustomEvent {
   feedback?: string;
 }
 
+const THREAD_STORAGE_KEY = "research-agent-thread-id";
+
 export default function App() {
   const [processedEventsTimeline, setProcessedEventsTimeline] = useState<
     ProcessedEvent[]
@@ -71,6 +73,12 @@ export default function App() {
   const hasFinalizeEventOccurredRef = useRef(false);
   const [error, setError] = useState<string | null>(null);
   const [dimensionFeedback, setDimensionFeedback] = useState("");
+  const [threadId, setThreadId] = useState<string | null>(() =>
+    window.localStorage.getItem(THREAD_STORAGE_KEY)
+  );
+  const [isRestoringThread, setIsRestoringThread] = useState(
+    () => window.localStorage.getItem(THREAD_STORAGE_KEY) !== null
+  );
   const thread = useStream<
     ResearchState,
     { InterruptType: DimensionReviewInterrupt }
@@ -80,6 +88,11 @@ export default function App() {
       (import.meta.env.DEV ? "http://localhost:2024" : window.location.origin),
     assistantId: "agent",
     messagesKey: "messages",
+    threadId,
+    onThreadId: (createdThreadId) => {
+      setThreadId(createdThreadId);
+      window.localStorage.setItem(THREAD_STORAGE_KEY, createdThreadId);
+    },
     onUpdateEvent: (event: GraphUpdateEvent) => {
       let processedEvent: ProcessedEvent | null = null;
       if (event.generate_research_dimensions) {
@@ -233,6 +246,16 @@ export default function App() {
   }, [thread.messages]);
 
   useEffect(() => {
+    if (!threadId || thread.history.length > 0 || thread.messages.length > 0) {
+      setIsRestoringThread(false);
+      return;
+    }
+
+    const timeout = window.setTimeout(() => setIsRestoringThread(false), 5000);
+    return () => window.clearTimeout(timeout);
+  }, [thread.history.length, thread.messages.length, threadId]);
+
+  useEffect(() => {
     if (
       hasFinalizeEventOccurredRef.current &&
       !thread.isLoading &&
@@ -297,7 +320,18 @@ export default function App() {
 
   const handleCancel = useCallback(() => {
     thread.stop();
-    window.location.reload();
+  }, [thread]);
+
+  const handleNewSearch = useCallback(() => {
+    thread.stop();
+    window.localStorage.removeItem(THREAD_STORAGE_KEY);
+    setThreadId(null);
+    setIsRestoringThread(false);
+    setError(null);
+    setDimensionFeedback("");
+    setProcessedEventsTimeline([]);
+    setHistoricalActivities({});
+    hasFinalizeEventOccurredRef.current = false;
   }, [thread]);
 
   const dimensionReview =
@@ -342,6 +376,10 @@ export default function App() {
                 </Button>
               </div>
             </div>
+          ) : isRestoringThread ? (
+            <div className="flex h-full items-center justify-center text-neutral-300">
+              Restoring previous research...
+            </div>
           ) : thread.messages.length === 0 &&
             !thread.isLoading &&
             !dimensionReview ? (
@@ -358,6 +396,7 @@ export default function App() {
                 scrollAreaRef={scrollAreaRef}
                 onSubmit={handleSubmit}
                 onCancel={handleCancel}
+                onNewSearch={handleNewSearch}
                 liveActivityEvents={processedEventsTimeline}
                 historicalActivities={historicalActivities}
               />
