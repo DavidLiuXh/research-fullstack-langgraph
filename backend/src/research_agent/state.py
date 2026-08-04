@@ -13,6 +13,11 @@ class ResearchDimension(TypedDict):
     scope: str
 
 
+class ClarificationTurn(TypedDict):
+    questions: list[str]
+    response: str
+
+
 class ResearchSource(TypedDict):
     research_run_id: str
     source_id: str
@@ -35,6 +40,15 @@ class DimensionResult(TypedDict):
 
 class OverallState(TypedDict):
     messages: Annotated[list, add_messages]
+    original_research_topic: str
+    normalized_research_topic: str
+    topic_needs_clarification: bool
+    topic_ambiguities: list[str]
+    topic_clarification_questions: list[str]
+    topic_assumptions: list[str]
+    topic_clarification_reason: str
+    topic_clarification_history: list[ClarificationTurn]
+    topic_clarification_action: str
     research_dimensions: list[ResearchDimension]
     research_run_id: str
     dimension_approved: bool

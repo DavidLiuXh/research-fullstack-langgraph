@@ -5,12 +5,17 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langgraph.graph import END
 
 from research_agent.graph import (
+    analyze_research_topic,
     dispatch_research_dimensions,
     finalize_answer,
     graph,
+    initialize_research_topic,
+    request_topic_clarification,
     review_research_dimensions,
     route_dimension_review,
     route_dimension_research,
+    route_topic_analysis,
+    route_topic_clarification,
     web_research,
 )
 from research_agent.tools_and_schemas import (
@@ -18,6 +23,7 @@ from research_agent.tools_and_schemas import (
     ResearchDimension,
     ResearchDimensionList,
     SearchQueryList,
+    TopicClarificationAssessment,
 )
 
 
@@ -54,6 +60,7 @@ def test_dimension_stops_at_loop_limit():
 def test_parent_dispatches_isolated_dimension_inputs():
     state = {
         "messages": [],
+        "normalized_research_topic": "Normalized topic",
         "research_run_id": "run",
         "research_dimensions": [
             {"id": "0", "title": "Market", "scope": "market scope"},
@@ -69,6 +76,127 @@ def test_parent_dispatches_isolated_dimension_inputs():
     assert sends[0].arg["dimension"]["id"] == "0"
     assert sends[1].arg["dimension"]["id"] == "1"
     assert sends[0].arg is not sends[1].arg
+    assert sends[0].arg["research_topic"] == "Normalized topic"
+
+
+def test_initialize_research_topic_resets_previous_clarification_state():
+    result = initialize_research_topic(
+        {
+            "messages": [HumanMessage(content="Research Apple")],
+            "topic_clarification_history": [
+                {"questions": ["Old question"], "response": "Old response"}
+            ],
+        }
+    )
+
+    assert result["original_research_topic"] == "Research Apple"
+    assert result["normalized_research_topic"] == "Research Apple"
+    assert result["topic_clarification_history"] == []
+
+
+def test_clear_topic_routes_to_dimension_generation():
+    assert (
+        route_topic_analysis({"topic_needs_clarification": False})
+        == "generate_research_dimensions"
+    )
+
+
+def test_ambiguous_topic_routes_to_human_clarification():
+    assert (
+        route_topic_analysis({"topic_needs_clarification": True})
+        == "request_topic_clarification"
+    )
+
+
+def test_clarification_response_is_recorded_and_reanalyzed(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+    monkeypatch.setattr(
+        graph_module,
+        "interrupt",
+        lambda value: {"action": "clarify", "response": "Apple Inc."},
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    state = {
+        "topic_ambiguities": ["Apple is ambiguous"],
+        "topic_clarification_questions": ["Company or fruit?"],
+        "topic_assumptions": ["Assume Apple Inc."],
+        "topic_clarification_reason": "Two interpretations",
+        "topic_clarification_history": [],
+    }
+
+    result = request_topic_clarification(state)
+
+    assert result["topic_clarification_action"] == "clarify"
+    assert result["topic_clarification_history"] == [
+        {"questions": ["Company or fruit?"], "response": "Apple Inc."}
+    ]
+    assert (
+        route_topic_clarification(result) == "analyze_research_topic"
+    )
+
+
+def test_accepting_assumptions_continues_to_dimension_generation(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+    monkeypatch.setattr(
+        graph_module,
+        "interrupt",
+        lambda value: {"action": "accept_assumptions"},
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    result = request_topic_clarification(
+        {
+            "topic_ambiguities": ["Time range is unclear"],
+            "topic_clarification_questions": ["Which time range?"],
+            "topic_assumptions": ["Use the past 12 months."],
+            "topic_clarification_reason": "Time range changes the evidence",
+            "topic_clarification_history": [],
+        }
+    )
+
+    assert result["topic_needs_clarification"] is False
+    assert (
+        route_topic_clarification(result) == "generate_research_dimensions"
+    )
+
+
+def test_topic_analysis_uses_clarification_history(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+    captured_prompts = []
+
+    class FakeAssessmentModel:
+        def with_structured_output(self, schema, method):
+            assert schema is TopicClarificationAssessment
+            assert method == "json_mode"
+            return self
+
+        def invoke(self, prompt):
+            captured_prompts.append(prompt)
+            return TopicClarificationAssessment(
+                needs_clarification=False,
+                ambiguities=[],
+                clarification_questions=[],
+                assumptions=[],
+                normalized_topic="Research Apple Inc. globally.",
+                reason="The subject is now clear.",
+            )
+
+    monkeypatch.setattr(
+        graph_module, "create_deepseek_model", lambda *a, **k: FakeAssessmentModel()
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    result = analyze_research_topic(
+        {
+            "original_research_topic": "Research Apple",
+            "topic_clarification_history": [
+                {"questions": ["Company or fruit?"], "response": "Apple Inc."}
+            ],
+        },
+        {},
+    )
+
+    assert result["topic_needs_clarification"] is False
+    assert result["normalized_research_topic"] == "Research Apple Inc. globally."
+    assert "Apple Inc." in captured_prompts[0]
 
 
 def test_dimension_review_rejection_requires_regeneration(monkeypatch):
@@ -109,6 +237,7 @@ def test_dimension_review_approval_dispatches_research(monkeypatch):
     monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
     state = {
         "messages": [],
+        "normalized_research_topic": "Normalized topic",
         "research_run_id": "run",
         "research_dimensions": [
             {"id": "0", "title": "Market", "scope": "market scope"}
@@ -129,6 +258,9 @@ def test_compiled_parent_graph_has_dimension_pipeline():
     assert graph.name == "deepseek-tavily-multidimensional-research-agent"
     assert {
         "generate_research_dimensions",
+        "initialize_research_topic",
+        "analyze_research_topic",
+        "request_topic_clarification",
         "review_research_dimensions",
         "research_dimension",
         "finalize_answer",
@@ -147,6 +279,15 @@ def test_parent_graph_runs_parallel_dimension_subgraphs(monkeypatch):
             return self
 
         def invoke(self, prompt):
+            if self.schema is TopicClarificationAssessment:
+                return TopicClarificationAssessment(
+                    needs_clarification=False,
+                    ambiguities=[],
+                    clarification_questions=[],
+                    assumptions=[],
+                    normalized_topic="Research this topic",
+                    reason="Clear",
+                )
             if self.schema is ResearchDimensionList:
                 return ResearchDimensionList(
                     dimensions=[
@@ -214,6 +355,7 @@ def test_parent_graph_runs_parallel_dimension_subgraphs(monkeypatch):
     event_types = {event["type"] for event in custom_events}
     assert {
         "planning_dimensions",
+        "topic_analyzed",
         "dimensions_created",
         "dimensions_reviewed",
         "queries_generated",
@@ -295,6 +437,7 @@ def test_final_answer_uses_only_current_research_run(monkeypatch):
     result = finalize_answer(
         {
             "messages": [HumanMessage(content="Current question")],
+            "normalized_research_topic": "Current normalized question",
             "research_run_id": "new",
             "dimension_results": [
                 dimension_result("old", "OLD DIMENSION CONTENT"),
@@ -310,5 +453,6 @@ def test_final_answer_uses_only_current_research_run(monkeypatch):
     )
 
     assert "NEW DIMENSION CONTENT" in captured_prompts[0]
+    assert "Current normalized question" in captured_prompts[0]
     assert "OLD DIMENSION CONTENT" not in captured_prompts[0]
     assert "https://example.com/new" in result["messages"][0].content

@@ -6,6 +6,37 @@ def get_current_date() -> str:
     return datetime.now().strftime("%B %d, %Y")
 
 
+topic_clarification_instructions = """Assess whether a research request requires clarification before research planning.
+
+Decision policy:
+- Request clarification only when ambiguity, a missing subject, or conflicting requirements would materially change the research dimensions or conclusions.
+- A broad topic, optional preferences, or details that can be handled with reasonable defaults are not by themselves blocking ambiguities.
+- Never ask for facts that web research can discover.
+- Ask no more than three concise, prioritized questions.
+- If clarification is needed, provide reasonable assumptions the user can accept instead.
+- Use all previous clarification responses and never repeat a resolved question.
+- If the user says to decide, use reasonable defaults and do not ask again.
+- `normalized_topic` must be a self-contained research brief. When clarification is needed, include the proposed assumptions so it can be used if the user accepts them.
+- Return valid JSON with exactly these keys: "needs_clarification", "ambiguities", "clarification_questions", "assumptions", "normalized_topic", and "reason".
+
+Example JSON:
+{{
+  "needs_clarification": true,
+  "ambiguities": ["Apple may refer to the company or the fruit industry."],
+  "clarification_questions": ["Does Apple refer to Apple Inc. or the fruit industry?"],
+  "assumptions": ["Assume the topic is Apple Inc. and focus on its global business."],
+  "normalized_topic": "Research Apple Inc., focusing on its global business, products, technology, competition, and risks.",
+  "reason": "The subject has two materially different interpretations."
+}}
+
+Original research request:
+{original_topic}
+
+Previous clarification turns:
+{clarification_history}
+"""
+
+
 dimension_instructions = """Decompose the user's research topic into distinct and complementary research dimensions.
 
 Requirements:
