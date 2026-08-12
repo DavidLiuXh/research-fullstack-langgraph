@@ -19,7 +19,7 @@ research loop. This fork introduces the following changes:
 
 | Area | Upstream | This fork |
 | --- | --- | --- |
-| LLM backend | Google Gemini | DeepSeek through its OpenAI-compatible API |
+| LLM backend | Google Gemini | DeepSeek through the native `langchain-deepseek` `ChatDeepSeek` integration |
 | Web search | Google Search | Tavily Search |
 | Research planning | Generate queries directly from the question | Clarify materially ambiguous topics, then decompose them into complementary research dimensions |
 | Human control | No approval gate | Human-in-the-loop topic clarification plus dimension approval and feedback loops |
@@ -63,8 +63,15 @@ The backend graph is defined in
    This loop continues until the user approves the plan.
 6. **Parallel dimension research.** The parent graph dispatches one isolated
    subgraph for every approved dimension.
-7. **Synthesize the report.** Completed dimension results are filtered to the
-   current research run, merged, and converted into a cited final report.
+7. **Draft the report.** Completed, evidence-backed claim sets are filtered to
+   the current research run and synthesized into a draft report.
+8. **Audit and revise.** An independent structured audit checks coverage,
+   factual support, citations, uncertainty, counterarguments, and clarity. A
+   failed audit returns the draft to revision while the bounded revision budget
+   remains.
+9. **Finalize the answer.** The final node validates source markers, renders
+   citations, and publishes the cited research report when the audit passes or
+   the revision limit is reached.
 
 ### Dimension subgraph
 
@@ -74,11 +81,18 @@ Every dimension runs the same independent loop:
    latest knowledge gap.
 2. **Web research.** Execute queries in parallel, normalize sources, assign
    stable source IDs, and retry transient Tavily failures.
-3. **Reflection.** Evaluate whether the evidence is sufficient for that
-   dimension.
-4. **Refine.** If evidence is insufficient and the loop budget remains, pass the
-   knowledge gap back to query generation. Otherwise return the dimension result
-   to the parent graph.
+3. **Evaluate sources.** Deduplicate and score candidate evidence for relevance,
+   authority, recency, primary-source status, and domain diversity. Weak or
+   redundant sources are rejected before reflection.
+4. **Reflection.** Evaluate whether the selected evidence is sufficient for that
+   dimension and identify concrete knowledge gaps.
+5. **Refine.** If evidence is insufficient and the loop budget remains, pass the
+   knowledge gap back to query generation.
+6. **Extract claims.** When research stops, convert selected evidence into a
+   concise auditable claim set before returning the dimension result to the
+   parent graph. The model uses a compact structured-output schema; source
+   validation, evidence excerpts, and internal metadata are derived
+   deterministically in code.
 
 Custom events from nested subgraphs are forwarded to the parent stream so the
 frontend can display query generation, searches, retries, reflections, and
@@ -96,6 +110,10 @@ dimension completion in real time.
 - Human-in-the-loop research-plan approval with iterative feedback.
 - Parallel research across independently isolated dimensions.
 - Reflection-driven follow-up queries within each dimension.
+- Quality-screened sources and per-dimension auditable claim extraction.
+- Independent report audit with a bounded revision loop.
+- Compact DeepSeek structured-output schemas with deterministic validation and
+  compatibility normalization.
 - Stable source markers and validated Markdown citations.
 - Live nested-subgraph activity in the frontend.
 - Persistent LangGraph thread recovery after a browser reload.
