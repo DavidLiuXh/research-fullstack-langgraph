@@ -73,6 +73,13 @@ interface ResearchCustomEvent {
   assumptions?: string[];
   action?: string;
   response?: string;
+  candidate_count?: number;
+  accepted_count?: number;
+  supplementary_count?: number;
+  rejected_count?: number;
+  claim_count?: number;
+  passes?: boolean;
+  revision_count?: number;
 }
 
 const THREAD_STORAGE_KEY = "research-agent-thread-id";
@@ -239,6 +246,18 @@ export default function App() {
             data: `Gathered ${event.source_count} sources for ${event.query}`,
           };
           break;
+        case "sources_evaluated":
+          processedEvent = {
+            title: `Evaluating Sources: ${event.dimension?.title || "Dimension"}`,
+            data: `${event.accepted_count || 0} accepted, ${event.supplementary_count || 0} supplementary, ${event.rejected_count || 0} rejected from ${event.candidate_count || 0} candidates`,
+          };
+          break;
+        case "source_evaluation_fallback":
+          processedEvent = {
+            title: `Source Evaluation Fallback: ${event.dimension?.title || "Dimension"}`,
+            data: "Structured source scoring was unavailable; conservative fallback scoring was applied.",
+          };
+          break;
         case "reflection_completed":
           processedEvent = {
             title: `Reflection: ${event.dimension?.title || "Dimension"}`,
@@ -247,10 +266,36 @@ export default function App() {
               : event.knowledge_gap,
           };
           break;
+        case "reflection_fallback":
+          processedEvent = {
+            title: `Reflection Fallback: ${event.dimension?.title || "Dimension"}`,
+            data: "Structured reflection was unavailable; conservative follow-up research was requested.",
+          };
+          break;
         case "dimension_completed":
           processedEvent = {
             title: "Dimension Research Complete",
             data: `${event.dimension?.title || "Dimension"} (${event.loops} loops)`,
+          };
+          break;
+        case "claims_extracted":
+          processedEvent = {
+            title: `Extracting Evidence Claims: ${event.dimension?.title || "Dimension"}`,
+            data: `${event.claim_count || 0} auditable claims retained`,
+          };
+          break;
+        case "drafting_report":
+          processedEvent = {
+            title: "Drafting Research Report",
+            data: "Composing the report from audited dimension claims.",
+          };
+          break;
+        case "report_audit_completed":
+          processedEvent = {
+            title: event.passes ? "Report Audit Passed" : "Report Revision Required",
+            data: event.passes
+              ? "Coverage, evidence, and citations passed review."
+              : `Revising the report after audit ${event.revision_count || 0}.`,
           };
           break;
         case "finalizing_answer":

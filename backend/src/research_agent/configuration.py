@@ -2,7 +2,7 @@ import os
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class Configuration(BaseModel):
@@ -40,6 +40,13 @@ class Configuration(BaseModel):
         description="Maximum research loops performed independently per dimension.",
     )
 
+    max_report_revisions: int = Field(
+        default=2,
+        ge=0,
+        le=5,
+        description="Maximum report revisions after independent quality audits.",
+    )
+
     tavily_search_depth: str = Field(
         default="advanced",
         description="Tavily search depth: basic or advanced.",
@@ -57,6 +64,65 @@ class Configuration(BaseModel):
         ge=0,
         le=5,
         description="Retries after the initial Tavily search attempt.",
+    )
+
+    @model_validator(mode="after")
+    def validate_source_thresholds(self):
+        """Ensure supplementary evidence cannot outrank accepted evidence."""
+        if self.source_supplementary_threshold > self.source_acceptance_threshold:
+            raise ValueError(
+                "source_supplementary_threshold must not exceed "
+                "source_acceptance_threshold"
+            )
+        return self
+
+    max_source_candidates_per_dimension: int = Field(
+        default=40,
+        ge=5,
+        le=100,
+        description="Maximum deduplicated sources assessed per dimension.",
+    )
+
+    max_selected_sources_per_dimension: int = Field(
+        default=12,
+        ge=3,
+        le=30,
+        description="Maximum quality-screened sources retained per dimension.",
+    )
+
+    max_sources_per_domain: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description="Maximum retained sources from one domain per dimension.",
+    )
+
+    source_acceptance_threshold: float = Field(
+        default=0.65,
+        ge=0,
+        le=1,
+        description="Evidence score required for an accepted source.",
+    )
+
+    source_supplementary_threshold: float = Field(
+        default=0.45,
+        ge=0,
+        le=1,
+        description="Minimum evidence score for supplementary evidence.",
+    )
+
+    max_claims_per_dimension: int = Field(
+        default=12,
+        ge=1,
+        le=30,
+        description="Maximum auditable claims retained per dimension.",
+    )
+
+    max_claim_source_chars: int = Field(
+        default=1800,
+        ge=500,
+        le=6000,
+        description="Maximum evidence characters per source sent to claim extraction.",
     )
 
     @classmethod

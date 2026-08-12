@@ -27,6 +27,27 @@ class ResearchSource(TypedDict):
     content: str
     score: NotRequired[float | None]
     published_date: NotRequired[str | None]
+    canonical_url: NotRequired[str]
+    domain: NotRequired[str]
+    source_type: NotRequired[str]
+    authority_score: NotRequired[float]
+    relevance_score: NotRequired[float]
+    recency_score: NotRequired[float]
+    evidence_score: NotRequired[float]
+    is_primary_source: NotRequired[bool]
+    is_likely_repost: NotRequired[bool]
+    supported_topics: NotRequired[list[str]]
+    rejection_reasons: NotRequired[list[str]]
+    quality_status: NotRequired[str]
+
+
+class EvidenceClaim(TypedDict):
+    claim: str
+    supporting_source_ids: list[str]
+    supporting_evidence: str
+    contradicting_source_ids: list[str]
+    confidence: float
+    uncertainty_reason: str
 
 
 class DimensionResult(TypedDict):
@@ -36,6 +57,13 @@ class DimensionResult(TypedDict):
     sources: list[ResearchSource]
     research_loop_count: int
     is_sufficient: bool
+    completion_status: str
+    covered_questions: list[str]
+    unresolved_gaps: list[dict]
+    contradictions: list[dict]
+    source_quality_issues: list[str]
+    confidence: float
+    claims: list[EvidenceClaim]
 
 
 class OverallState(TypedDict):
@@ -58,6 +86,10 @@ class OverallState(TypedDict):
     initial_search_query_count: int
     max_research_loops: int
     reasoning_model: str
+    report_draft: str
+    report_audit: dict
+    report_revision_count: int
+    max_report_revisions: int
 
 
 class DimensionState(TypedDict):
@@ -72,6 +104,16 @@ class DimensionState(TypedDict):
     max_research_loops: int
     research_loop_count: int
     is_sufficient: bool
+    query_history: Annotated[list[str], operator.add]
+    evaluated_sources: list[ResearchSource]
+    selected_sources: list[ResearchSource]
+    rejected_sources: list[ResearchSource]
+    reflection_assessment: dict
+    reflection_history: Annotated[list[dict], operator.add]
+    evidence_source_count_history: Annotated[list[int], operator.add]
+    completion_status: str
+    claims: list[EvidenceClaim]
+    dimension_summary: str
 
 
 class DimensionInput(TypedDict):
@@ -88,6 +130,7 @@ class QueryGenerationState(TypedDict):
     dimension: ResearchDimension
     search_query: list[str]
     research_loop_count: int
+    query_history: Annotated[list[str], operator.add]
 
 
 class WebSearchState(TypedDict):
