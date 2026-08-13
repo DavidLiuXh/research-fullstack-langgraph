@@ -58,5 +58,6 @@ convention = "google"
 [dependency-groups]
 dev = [
     "langgraph-cli[inmem]>=0.1.71",
+    "langsmith>=0.3.37",
     "pytest>=8.3.5",
 ]

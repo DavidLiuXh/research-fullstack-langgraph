@@ -16,6 +16,7 @@ from research_agent.graph import (
     reflection,
     request_topic_clarification,
     review_research_dimensions,
+    revise_report,
     route_dimension_research,
     route_dimension_review,
     route_report_audit,
@@ -691,6 +692,51 @@ def test_report_audit_route_is_bounded():
         )
         == "finalize_answer"
     )
+
+
+def test_report_revision_keeps_draft_when_both_attempts_hit_length_limit(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class TestLengthError(Exception):
+        pass
+
+    class LengthLimitedModel:
+        def invoke(self, prompt):
+            raise TestLengthError("limit")
+
+    events = []
+    monkeypatch.setattr(graph_module, "LengthFinishReasonError", TestLengthError)
+    monkeypatch.setattr(
+        graph_module, "create_deepseek_model", lambda *a, **k: LengthLimitedModel()
+    )
+    monkeypatch.setattr(
+        graph_module,
+        "emit_research_event",
+        lambda event_type, **data: events.append({"type": event_type, **data}),
+    )
+    result = revise_report(
+        {
+            "normalized_research_topic": "Current topic",
+            "research_run_id": "run",
+            "dimension_results": [],
+            "sources_gathered": [],
+            "report_draft": "Existing audited draft [S1].",
+            "report_audit": {
+                "passes": False,
+                "issues": ["Tighten wording."],
+                "revision_instructions": ["Be concise."],
+            },
+            "report_revision_count": 0,
+        },
+        {},
+    )
+
+    assert result["report_draft"] == "Existing audited draft [S1]."
+    assert result["report_revision_count"] == 1
+    assert [event["type"] for event in events] == [
+        "report_revision_retry",
+        "report_revision_skipped",
+    ]
 
 
 def test_report_audit_rejects_unknown_source_markers(monkeypatch):

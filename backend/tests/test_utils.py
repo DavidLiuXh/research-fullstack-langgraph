@@ -199,3 +199,38 @@ def test_dimension_results_are_grouped_in_dimension_order():
         "Dimension 1: Technology"
     )
     assert "loop_limit_reached after 2 loop(s)" in rendered
+
+
+def test_dimension_results_include_claim_excerpt_but_not_full_source_content():
+    results = [
+        {
+            "research_run_id": "run",
+            "dimension": {"id": "0", "title": "Market", "scope": "Market"},
+            "research_content": "summary",
+            "sources": [
+                {
+                    "source_id": "S1",
+                    "title": "Source",
+                    "url": "https://example.com",
+                    "content": "FULL SOURCE CONTENT MUST NOT BE REPEATED",
+                }
+            ],
+            "research_loop_count": 1,
+            "is_sufficient": True,
+            "claims": [
+                {
+                    "claim": "Supported claim",
+                    "supporting_source_ids": ["S1"],
+                    "supporting_evidence": "Compact evidence excerpt.",
+                    "contradicting_source_ids": [],
+                    "confidence": 0.5,
+                    "uncertainty_reason": "",
+                }
+            ],
+        }
+    ]
+
+    rendered = format_dimension_results(results)
+
+    assert "Compact evidence excerpt." in rendered
+    assert "FULL SOURCE CONTENT MUST NOT BE REPEATED" not in rendered
