@@ -1,3 +1,5 @@
+"""LangGraph workflow for clarification, dimension research, and reporting."""
+
 # ruff: noqa: E402
 
 import json
@@ -928,6 +930,18 @@ def _audited_claim_source_ids(results: list[DimensionResult]) -> set[str]:
     }
 
 
+def _partial_length_limited_content(error: LengthFinishReasonError) -> str:
+    """Recover usable text returned before a provider output limit was reached."""
+    completion = getattr(error, "completion", None)
+    choices = getattr(completion, "choices", ())
+    if choices:
+        message = getattr(choices[0], "message", None)
+        content = getattr(message, "content", None)
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    raise error
+
+
 def draft_report(state: OverallState, config: RunnableConfig):
     """Draft the report from audited dimension claims."""
     configurable = Configuration.from_runnable_config(config)
@@ -939,7 +953,43 @@ def draft_report(state: OverallState, config: RunnableConfig):
         research_topic=state["normalized_research_topic"],
         dimension_research=material,
     )
-    result = create_deepseek_model(model, thinking=True).invoke(prompt)
+    try:
+        result = create_deepseek_model(model).invoke(prompt)
+    except LengthFinishReasonError:
+        current_results, _, _ = _current_research_material(state)
+        compact_material = format_dimension_results(
+            current_results, max_claims_per_dimension=5, max_evidence_chars=120
+        )
+        emit_research_event(
+            "report_draft_retry",
+            research_run_id=state["research_run_id"],
+            reason="length_limit",
+        )
+        compact_prompt = (
+            answer_instructions.format(
+                current_date=get_current_date(),
+                research_topic=state["normalized_research_topic"],
+                dimension_research=compact_material,
+            )
+            + "\nThe first draft exceeded the output limit. Write a concise executive "
+            "report under 800 words or 1,600 Chinese characters. Use short sections, "
+            "do not repeat evidence, and stop immediately after the conclusion."
+        )
+        try:
+            result = create_deepseek_model(model).invoke(compact_prompt)
+            report_draft = str(result.content)
+        except LengthFinishReasonError as retry_error:
+            report_draft = _partial_length_limited_content(retry_error)
+            emit_research_event(
+                "report_draft_partial_recovered",
+                research_run_id=state["research_run_id"],
+                reason="length_limit",
+            )
+        return {
+            "report_draft": report_draft,
+            "report_revision_count": 0,
+            "max_report_revisions": configurable.max_report_revisions,
+        }
     return {
         "report_draft": str(result.content),
         "report_revision_count": 0,
@@ -1011,14 +1061,42 @@ def revise_report(state: OverallState, config: RunnableConfig):
     """Revise only the issues identified by the independent audit."""
     configurable = Configuration.from_runnable_config(config)
     model = state.get("reasoning_model") or configurable.answer_model
-    _, _, material = _current_research_material(state)
+    current_results, _, _ = _current_research_material(state)
+    material = format_dimension_results(
+        current_results, max_claims_per_dimension=5, max_evidence_chars=120
+    )
     prompt = report_revision_instructions.format(
         research_topic=state["normalized_research_topic"],
         dimension_research=material,
         draft_report=state["report_draft"],
         audit_findings=json.dumps(state["report_audit"], ensure_ascii=False),
     )
-    result = create_deepseek_model(model, thinking=True).invoke(prompt)
+    try:
+        result = create_deepseek_model(model).invoke(prompt)
+    except LengthFinishReasonError:
+        emit_research_event(
+            "report_revision_retry",
+            research_run_id=state["research_run_id"],
+            reason="length_limit",
+        )
+        retry_prompt = (
+            prompt
+            + "\nThe previous revision exceeded the output limit. Return the complete "
+            "revised report in under 800 words or 1,600 Chinese characters. Use short "
+            "sections, do not repeat evidence, and stop after the conclusion."
+        )
+        try:
+            result = create_deepseek_model(model).invoke(retry_prompt)
+        except LengthFinishReasonError:
+            emit_research_event(
+                "report_revision_skipped",
+                research_run_id=state["research_run_id"],
+                reason="length_limit",
+            )
+            return {
+                "report_draft": state["report_draft"],
+                "report_revision_count": state.get("report_revision_count", 0) + 1,
+            }
     return {
         "report_draft": str(result.content),
         "report_revision_count": state.get("report_revision_count", 0) + 1,

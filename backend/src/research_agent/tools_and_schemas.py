@@ -30,6 +30,14 @@ class SearchQueryList(BaseModel):
         description="A brief explanation of why these queries are relevant."
     )
 
+    @field_validator("query", mode="before")
+    @classmethod
+    def normalize_single_query(cls, value):
+        """Accept a single query string when only one query was requested."""
+        if isinstance(value, str):
+            return [value]
+        return value
+
 
 class ResearchDimension(BaseModel):
     title: str = Field(description="A concise name for this research dimension.")

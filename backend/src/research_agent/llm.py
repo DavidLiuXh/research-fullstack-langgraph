@@ -3,10 +3,16 @@
 import os
 
 from langchain_deepseek import ChatDeepSeek
+from pydantic import SecretStr
 
 
 def create_deepseek_model(
-    model: str, *, temperature: float = 0, thinking: bool = False
+    model: str,
+    *,
+    temperature: float = 0,
+    thinking: bool = False,
+    max_retries: int = 4,
+    timeout: float = 180,
 ) -> ChatDeepSeek:
     """Create a chat model using LangChain's native DeepSeek integration."""
     api_key = os.getenv("DEEPSEEK_API_KEY")
@@ -15,9 +21,10 @@ def create_deepseek_model(
 
     return ChatDeepSeek(
         model=model,
-        api_key=api_key,
-        api_base=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        api_key=SecretStr(api_key),
+        base_url=os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
         temperature=temperature,
-        max_retries=2,
+        max_retries=max_retries,
+        timeout=timeout,
         extra_body={"thinking": {"type": "enabled" if thinking else "disabled"}},
     )

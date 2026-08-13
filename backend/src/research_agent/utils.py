@@ -212,8 +212,13 @@ def format_rejected_source_summary(sources: list[ResearchSource]) -> str:
     )
 
 
-def format_dimension_results(results: list[DimensionResult]) -> str:
-    """Group audited claims, limitations, and evidence by dimension."""
+def format_dimension_results(
+    results: list[DimensionResult],
+    *,
+    max_claims_per_dimension: int = 8,
+    max_evidence_chars: int = 220,
+) -> str:
+    """Group compact audited claims and limitations by dimension."""
     if not results:
         return "No dimension research was completed."
 
@@ -223,7 +228,7 @@ def format_dimension_results(results: list[DimensionResult]) -> str:
         status = result.get("completion_status") or (
             "sufficient" if result["is_sufficient"] else "loop_limit_reached"
         )
-        claims = result.get("claims", [])
+        claims = result.get("claims", [])[:max_claims_per_dimension]
         claim_text = (
             "\n".join(
                 f"- {claim['claim']} "
@@ -240,12 +245,11 @@ def format_dimension_results(results: list[DimensionResult]) -> str:
                     if claim["uncertainty_reason"]
                     else ""
                 )
-                + f"\n  Evidence: {claim['supporting_evidence']}"
+                + f"\n  Evidence: {claim['supporting_evidence'][:max_evidence_chars]}"
                 for claim in claims
             )
             or "No auditable claims were extracted for this dimension."
         )
-        selected_evidence = format_sources_for_research(result.get("sources", []))
         sections.append(
             f"## Dimension {dimension['id']}: {dimension['title']}\n"
             f"Scope: {dimension['scope']}\n"
@@ -254,8 +258,7 @@ def format_dimension_results(results: list[DimensionResult]) -> str:
             f"Source quality issues: {result.get('source_quality_issues', [])}\n"
             f"Unresolved gaps: {result.get('unresolved_gaps', [])}\n"
             f"Contradictions: {result.get('contradictions', [])}\n\n"
-            f"Audited claims:\n{claim_text}\n\n"
-            f"Selected evidence:\n{selected_evidence}"
+            f"Audited claims and evidence excerpts:\n{claim_text}"
         )
     return "\n\n=====\n\n".join(sections)
 
