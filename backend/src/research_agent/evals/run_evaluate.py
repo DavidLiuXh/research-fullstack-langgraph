@@ -115,6 +115,14 @@ async def evaluate_example(
                 for result in outputs.get("dimension_results", [])
             ),
             "revisions": outputs.get("report_revision_count", 0),
+            "completion_statuses": [
+                result.get("completion_status", "unknown")
+                for result in outputs.get("dimension_results", [])
+            ],
+            "search_failures": sum(
+                int(result.get("search_failure_count", 0))
+                for result in outputs.get("dimension_results", [])
+            ),
         },
     }
 

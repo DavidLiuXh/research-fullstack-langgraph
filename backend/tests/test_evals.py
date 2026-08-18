@@ -67,14 +67,39 @@ def test_deterministic_evaluator_scores_valid_evidence_and_trajectory():
                 "quality_status": "accepted",
                 "evidence_score": 0.9,
                 "domain": "example.com",
+                "content": "A directly supported statement from the source.",
+                "is_primary_source": True,
+                "is_authoritative_source": True,
             }
         ],
         "dimension_results": [
             {
                 "is_sufficient": True,
+                "sources": [
+                    {
+                        "source_id": "S1",
+                        "quality_status": "accepted",
+                        "is_primary_source": True,
+                        "is_authoritative_source": True,
+                    }
+                ],
+                "known_gap_count": 1,
+                "resolved_gap_count": 1,
+                "high_priority_gap_count": 1,
+                "resolved_high_priority_gap_count": 1,
+                "high_priority_gap_source_coverage_count": 1,
+                "evidence_gain_history": [{"total_gain": 1}],
+                "completion_status": "sufficient",
                 "claims": [
                     {
                         "supporting_source_ids": ["S1"],
+                        "supporting_evidence": [
+                            {
+                                "source_id": "S1",
+                                "quote": "A directly supported statement from the source.",
+                                "locator": "chars:0-47",
+                            }
+                        ],
                         "contradicting_source_ids": [],
                     }
                 ],
@@ -91,6 +116,35 @@ def test_deterministic_evaluator_scores_valid_evidence_and_trajectory():
         )
     )
     assert all(value == 1 for value in scores.values())
+
+
+def test_claim_evidence_coverage_requires_a_quote_present_in_its_source():
+    outputs = {
+        "sources": [
+            {
+                "source_id": "S1",
+                "content": "The official result was 42 percent in 2025.",
+            }
+        ],
+        "dimension_results": [
+            {
+                "claims": [
+                    {
+                        "supporting_source_ids": ["S1"],
+                        "supporting_evidence": [
+                            {"source_id": "S1", "quote": "A fabricated quote."}
+                        ],
+                        "contradicting_source_ids": [],
+                    }
+                ]
+            }
+        ],
+    }
+
+    scores = _scores_by_key(evaluate_deterministic_quality({"messages": []}, outputs))
+
+    assert scores["claim_evidence_coverage"] == 0
+    assert scores["exact_quote_validity"] == 0
 
 
 def test_target_resumes_both_interrupts_and_collects_events(monkeypatch):
@@ -236,8 +290,18 @@ def test_groundedness_evaluator_filters_invalid_indexes(monkeypatch):
             "dimension_results": [
                 {
                     "claims": [
-                        {"claim": "Supported", "supporting_evidence": "Evidence"},
-                        {"claim": "Unsupported", "supporting_evidence": "Other"},
+                        {
+                            "claim": "Supported",
+                            "supporting_evidence": [
+                                {"source_id": "S1", "quote": "Evidence"}
+                            ],
+                        },
+                        {
+                            "claim": "Unsupported",
+                            "supporting_evidence": [
+                                {"source_id": "S2", "quote": "Other"}
+                            ],
+                        },
                     ]
                 }
             ]

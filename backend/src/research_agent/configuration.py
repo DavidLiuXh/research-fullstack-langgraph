@@ -36,7 +36,9 @@ class Configuration(BaseModel):
     )
 
     max_research_loops: int = Field(
-        default=2,
+        default=3,
+        ge=1,
+        le=8,
         description="Maximum research loops performed independently per dimension.",
     )
 
@@ -74,6 +76,15 @@ class Configuration(BaseModel):
                 "source_supplementary_threshold must not exceed "
                 "source_acceptance_threshold"
             )
+        for field_name in (
+            "min_accepted_sources_per_dimension",
+            "min_authoritative_sources_per_dimension",
+            "min_primary_sources_per_dimension",
+        ):
+            if getattr(self, field_name) > self.max_selected_sources_per_dimension:
+                raise ValueError(
+                    f"{field_name} must not exceed max_selected_sources_per_dimension"
+                )
         return self
 
     max_source_candidates_per_dimension: int = Field(
@@ -85,7 +96,7 @@ class Configuration(BaseModel):
 
     max_selected_sources_per_dimension: int = Field(
         default=12,
-        ge=3,
+        ge=1,
         le=30,
         description="Maximum quality-screened sources retained per dimension.",
     )
@@ -111,6 +122,27 @@ class Configuration(BaseModel):
         description="Minimum evidence score for supplementary evidence.",
     )
 
+    min_accepted_sources_per_dimension: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description="Minimum accepted sources required before a dimension is sufficient.",
+    )
+
+    min_authoritative_sources_per_dimension: int = Field(
+        default=1,
+        ge=0,
+        le=10,
+        description="Minimum authoritative sources required per completed dimension.",
+    )
+
+    min_primary_sources_per_dimension: int = Field(
+        default=1,
+        ge=0,
+        le=10,
+        description="Minimum primary sources required per completed dimension.",
+    )
+
     max_claims_per_dimension: int = Field(
         default=12,
         ge=1,
@@ -123,6 +155,13 @@ class Configuration(BaseModel):
         ge=500,
         le=6000,
         description="Maximum evidence characters per source sent to claim extraction.",
+    )
+
+    min_evidence_quote_chars: int = Field(
+        default=12,
+        ge=6,
+        le=100,
+        description="Minimum normalized length of an evidence quote.",
     )
 
     @classmethod

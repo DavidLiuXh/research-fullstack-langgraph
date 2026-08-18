@@ -42,7 +42,15 @@ class DeepSeekGroundednessEvaluator:
         claims = [
             {
                 "claim": claim.get("claim", ""),
-                "evidence": claim.get("supporting_evidence", "")[:1200],
+                "evidence": [
+                    {
+                        "source_id": item.get("source_id", ""),
+                        "quote": item.get("quote", "")[:800],
+                        "locator": item.get("locator", ""),
+                    }
+                    for item in claim.get("supporting_evidence", [])
+                    if isinstance(item, dict)
+                ][:3],
             }
             for result in outputs.get("dimension_results", [])
             for claim in result.get("claims", [])

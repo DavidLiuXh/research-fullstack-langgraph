@@ -19,6 +19,54 @@ TRACKING_QUERY_PARAMETERS = {
 MAX_SOURCE_SNIPPET_CHARS = 6000
 
 
+def _normalized_text_with_offsets(value: str) -> tuple[str, list[int]]:
+    """Normalize searchable text while retaining offsets into the original value."""
+    normalized: list[str] = []
+    offsets: list[int] = []
+    previous_was_space = False
+    for index, character in enumerate(value):
+        expanded = unicodedata.normalize("NFKC", character).casefold()
+        for item in expanded:
+            if item.isspace():
+                if previous_was_space:
+                    continue
+                item = " "
+                previous_was_space = True
+            else:
+                previous_was_space = False
+            normalized.append(item)
+            offsets.append(index)
+    while normalized and normalized[0] == " ":
+        normalized.pop(0)
+        offsets.pop(0)
+    while normalized and normalized[-1] == " ":
+        normalized.pop()
+        offsets.pop()
+    return "".join(normalized), offsets
+
+
+def locate_evidence_quote(
+    source_content: str, quote: str, *, min_chars: int = 12
+) -> tuple[str, str] | None:
+    """Return the exact source excerpt and character locator for a verified quote."""
+    normalized_source, offsets = _normalized_text_with_offsets(source_content)
+    normalized_quote, _ = _normalized_text_with_offsets(quote)
+    if len(normalized_quote) < min_chars or not normalized_source or not offsets:
+        return None
+    match_start = normalized_source.find(normalized_quote)
+    if match_start < 0:
+        return None
+    match_end = match_start + len(normalized_quote) - 1
+    if match_end >= len(offsets):
+        return None
+    original_start = offsets[match_start]
+    original_end = offsets[match_end] + 1
+    excerpt = source_content[original_start:original_end].strip()
+    if not excerpt:
+        return None
+    return excerpt, f"chars:{original_start}-{original_end}"
+
+
 def get_research_topic(messages: list[AnyMessage]) -> str:
     """Build the research topic, retaining prior human/assistant context."""
     if len(messages) == 1:
@@ -96,8 +144,8 @@ def format_sources_for_research(
 def deduplicate_sources(sources: list[ResearchSource]) -> list[ResearchSource]:
     """Deduplicate sources while preferring stronger, more complete results."""
     unique: list[ResearchSource] = []
-    seen_urls: set[str] = set()
-    seen_titles: set[str] = set()
+    seen_urls: dict[str, ResearchSource] = {}
+    seen_titles: dict[str, ResearchSource] = {}
     ranked_sources = sorted(
         sources,
         key=lambda source: (
@@ -111,20 +159,54 @@ def deduplicate_sources(sources: list[ResearchSource]) -> list[ResearchSource]:
         canonical_url = source.get("canonical_url") or canonicalize_url(source["url"])
         normalized_title = normalize_title(source["title"])
         title_is_distinctive = len(normalized_title) >= 20
-        if canonical_url in seen_urls or (
-            title_is_distinctive and normalized_title in seen_titles
-        ):
+        duplicate = seen_urls.get(canonical_url)
+        if duplicate is None and title_is_distinctive:
+            duplicate = seen_titles.get(normalized_title)
+        if duplicate is not None:
+            duplicate["gap_ids"] = list(
+                dict.fromkeys(
+                    [
+                        *duplicate.get("gap_ids", []),
+                        *source.get("gap_ids", []),
+                        *([source["gap_id"]] if source.get("gap_id") else []),
+                    ]
+                )
+            )
+            duplicate["requested_source_types"] = sorted(
+                set(duplicate.get("requested_source_types", []))
+                | set(source.get("requested_source_types", []))
+            )
+            expectations = list(
+                dict.fromkeys(
+                    item
+                    for item in (
+                        duplicate.get("expected_evidence", ""),
+                        source.get("expected_evidence", ""),
+                    )
+                    if item
+                )
+            )
+            duplicate["expected_evidence"] = " | ".join(expectations)
             continue
-        seen_urls.add(canonical_url)
-        if title_is_distinctive:
-            seen_titles.add(normalized_title)
-        unique.append(
-            {
-                **source,
-                "canonical_url": canonical_url,
-                "domain": urlsplit(canonical_url).netloc,
-            }
+        normalized_source: ResearchSource = {
+            **source,
+            "canonical_url": canonical_url,
+            "domain": urlsplit(canonical_url).netloc,
+        }
+        source_gap_ids = list(
+            dict.fromkeys(
+                [
+                    *source.get("gap_ids", []),
+                    *([source["gap_id"]] if source.get("gap_id") else []),
+                ]
+            )
         )
+        if source_gap_ids:
+            normalized_source["gap_ids"] = source_gap_ids
+        seen_urls[canonical_url] = normalized_source
+        if title_is_distinctive:
+            seen_titles[normalized_title] = normalized_source
+        unique.append(normalized_source)
     return unique
 
 
@@ -195,6 +277,8 @@ def format_source_candidates(sources: list[ResearchSource]) -> str:
         f"Title: {source['title']}\n"
         f"Domain: {source.get('domain', '')}\n"
         f"Published: {source.get('published_date') or 'unknown'}\n"
+        f"Requested source types: {source.get('requested_source_types', [])}\n"
+        f"Evidence expected: {source.get('expected_evidence', '')}\n"
         f"Search score: {source.get('score')}\n"
         f"Snippet: {source['content']}"
         for source in sources
@@ -245,7 +329,10 @@ def format_dimension_results(
                     if claim["uncertainty_reason"]
                     else ""
                 )
-                + f"\n  Evidence: {claim['supporting_evidence'][:max_evidence_chars]}"
+                + "\n  Evidence: "
+                + _format_claim_evidence(
+                    claim.get("supporting_evidence", []), max_evidence_chars
+                )
                 for claim in claims
             )
             or "No auditable claims were extracted for this dimension."
@@ -261,6 +348,31 @@ def format_dimension_results(
             f"Audited claims and evidence excerpts:\n{claim_text}"
         )
     return "\n\n=====\n\n".join(sections)
+
+
+def _format_claim_evidence(evidence: object, max_chars: int) -> str:
+    """Render verified evidence quotes while tolerating legacy string claims."""
+    if isinstance(evidence, str):
+        return evidence[:max_chars]
+    if not isinstance(evidence, list):
+        return "No verified evidence quote."
+    rendered: list[str] = []
+    remaining = max_chars
+    for item in evidence:
+        if not isinstance(item, dict):
+            continue
+        source_id = str(item.get("source_id", ""))
+        quote = str(item.get("quote", ""))
+        locator = str(item.get("locator", ""))
+        block = f'[{source_id}] "{quote}" ({locator})'
+        if rendered and len(block) > remaining:
+            break
+        block = block[:remaining]
+        rendered.append(block)
+        remaining -= len(block)
+        if remaining <= 0:
+            break
+    return " | ".join(rendered) or "No verified evidence quote."
 
 
 def render_source_citations(
