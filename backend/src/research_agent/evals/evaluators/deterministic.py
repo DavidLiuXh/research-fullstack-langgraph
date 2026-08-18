@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from research_agent.utils import locate_evidence_quote
+
 
 def _score(key: str, value: float, comment: str = "") -> dict[str, Any]:
     return {"key": key, "score": max(0.0, min(float(value), 1.0)), "comment": comment}
@@ -24,6 +26,7 @@ def evaluate_deterministic_quality(
     reference = reference_outputs or {}
     sources = outputs.get("sources", [])
     source_ids = {source.get("source_id") for source in sources}
+    source_by_id = {source.get("source_id"): source for source in sources}
     dimensions = outputs.get("dimension_results", [])
     claims = [claim for result in dimensions for claim in result.get("claims", [])]
     claim_source_ids = [
@@ -51,6 +54,77 @@ def evaluate_deterministic_quality(
     domains = {source.get("domain") for source in selected if source.get("domain")}
     sufficient_dimensions = [
         result for result in dimensions if result.get("is_sufficient")
+    ]
+    evidence_items = [
+        evidence
+        for claim in claims
+        for evidence in claim.get("supporting_evidence", [])
+        if isinstance(evidence, dict)
+    ]
+    valid_evidence_items = [
+        evidence
+        for evidence in evidence_items
+        if (source := source_by_id.get(evidence.get("source_id")))
+        and locate_evidence_quote(
+            str(source.get("content", "")), str(evidence.get("quote", ""))
+        )
+    ]
+    claims_with_evidence = [
+        claim
+        for claim in claims
+        if any(
+            isinstance(evidence, dict)
+            and (source := source_by_id.get(evidence.get("source_id")))
+            and locate_evidence_quote(
+                str(source.get("content", "")), str(evidence.get("quote", ""))
+            )
+            for evidence in claim.get("supporting_evidence", [])
+        )
+    ]
+    known_gap_count = sum(
+        int(result.get("known_gap_count", 0)) for result in dimensions
+    )
+    resolved_gap_count = sum(
+        int(result.get("resolved_gap_count", 0)) for result in dimensions
+    )
+    high_gap_count = sum(
+        int(result.get("high_priority_gap_count", 0)) for result in dimensions
+    )
+    resolved_high_gap_count = sum(
+        int(result.get("resolved_high_priority_gap_count", 0)) for result in dimensions
+    )
+    high_gap_source_coverage_count = sum(
+        int(result.get("high_priority_gap_source_coverage_count", 0))
+        for result in dimensions
+    )
+    gain_history = [
+        gain
+        for result in dimensions
+        for gain in result.get("evidence_gain_history", [])
+    ]
+    gainful_loops = [gain for gain in gain_history if gain.get("total_gain", 0) > 0]
+    available_dimensions = [
+        result
+        for result in dimensions
+        if result.get("completion_status") != "search_unavailable"
+    ]
+    dimensions_with_primary = [
+        result
+        for result in dimensions
+        if any(
+            source.get("quality_status") == "accepted"
+            and source.get("is_primary_source")
+            for source in result.get("sources", [])
+        )
+    ]
+    dimensions_with_authority = [
+        result
+        for result in dimensions
+        if any(
+            source.get("quality_status") == "accepted"
+            and source.get("is_authoritative_source")
+            for source in result.get("sources", [])
+        )
     ]
 
     event_types = {
@@ -96,6 +170,14 @@ def evaluate_deterministic_quality(
             _ratio(len(valid_claim_ids), len(claim_source_ids), empty=0.0),
         ),
         _score(
+            "claim_evidence_coverage",
+            _ratio(len(claims_with_evidence), len(claims), empty=0.0),
+        ),
+        _score(
+            "exact_quote_validity",
+            _ratio(len(valid_evidence_items), len(evidence_items), empty=0.0),
+        ),
+        _score(
             "dimension_completion",
             _ratio(len(sufficient_dimensions), len(dimensions), empty=0.0),
             f"{len(sufficient_dimensions)}/{len(dimensions)} dimensions declared sufficient.",
@@ -107,6 +189,39 @@ def evaluate_deterministic_quality(
         _score(
             "source_domain_diversity",
             _ratio(len(domains), len(selected), empty=0.0),
+        ),
+        _score(
+            "primary_source_dimension_coverage",
+            _ratio(len(dimensions_with_primary), len(dimensions), empty=0.0),
+        ),
+        _score(
+            "authoritative_source_dimension_coverage",
+            _ratio(len(dimensions_with_authority), len(dimensions), empty=0.0),
+        ),
+        _score(
+            "gap_resolution",
+            _ratio(resolved_gap_count, known_gap_count, empty=1.0),
+            f"{resolved_gap_count}/{known_gap_count} known gaps resolved.",
+        ),
+        _score(
+            "high_priority_gap_resolution",
+            _ratio(resolved_high_gap_count, high_gap_count, empty=1.0),
+            f"{resolved_high_gap_count}/{high_gap_count} high-priority gaps resolved.",
+        ),
+        _score(
+            "high_priority_gap_source_coverage",
+            _ratio(high_gap_source_coverage_count, high_gap_count, empty=1.0),
+            f"{high_gap_source_coverage_count}/{high_gap_count} high-priority gaps have accepted requested-type evidence.",
+        ),
+        _score(
+            "evidence_gain_per_loop",
+            _ratio(len(gainful_loops), len(gain_history), empty=0.0),
+            f"{len(gainful_loops)}/{len(gain_history)} loops added evidence or resolved gaps.",
+        ),
+        _score(
+            "search_availability",
+            _ratio(len(available_dimensions), len(dimensions), empty=0.0),
+            f"{len(available_dimensions)}/{len(dimensions)} dimensions had usable search access.",
         ),
         _score(
             "trajectory_completeness",

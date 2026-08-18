@@ -7,7 +7,9 @@ import os
 import re
 import sys
 import time
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 # The CLI executes this file by path, so the src-layout package root is not
@@ -53,6 +55,7 @@ from research_agent.tools_and_schemas import (
     Reflection,
     ReportAudit,
     ResearchDimensionList,
+    ResearchGap,
     SearchQueryList,
     SourceAssessment,
     SourceAssessmentList,
@@ -66,12 +69,106 @@ from research_agent.utils import (
     format_source_candidates,
     format_sources_for_research,
     get_research_topic,
+    locate_evidence_quote,
     normalize_search_score,
     render_source_citations,
     tavily_results_to_sources,
 )
 
 load_dotenv()
+
+AUTHORITATIVE_SOURCE_TYPES = {
+    "government",
+    "academic",
+    "official_company",
+    "standards_body",
+    "international_organization",
+    "industry_association",
+    "research_institute",
+}
+
+
+def _default_source_types(
+    research_topic: str, dimension: Mapping[str, str]
+) -> list[str]:
+    """Infer a compact authoritative-source strategy for an initial search pass."""
+    context = f"{research_topic} {dimension['title']} {dimension['scope']}".casefold()
+    if any(term in context for term in ("law", "regulation", "policy", "法规", "政策")):
+        return ["government", "international_organization", "standards_body"]
+    if any(
+        term in context
+        for term in ("technology", "technical", "software", "技术", "架构")
+    ):
+        return ["official_company", "standards_body", "academic"]
+    if any(term in context for term in ("market", "industry", "市场", "行业")):
+        return ["government", "industry_association", "research_institute"]
+    return ["government", "academic", "official_company"]
+
+
+def _prioritized_gaps(state: DimensionState) -> list[dict]:
+    """Return unresolved gaps in impact order, or a scoped initial evidence need."""
+    gaps = list(state.get("reflection_assessment", {}).get("missing_questions", []))
+    if not gaps:
+        gaps = [
+            {
+                "gap_id": "initial-dimension-scope",
+                "question": state["dimension"]["scope"],
+                "reason": "This is the initial evidence pass for the dimension.",
+                "priority": "high",
+                "required_source_types": _default_source_types(
+                    state["research_topic"], state["dimension"]
+                ),
+                "expected_evidence": state["dimension"]["scope"],
+                "suggested_query_focus": state["dimension"]["scope"],
+            }
+        ]
+    priority = {"high": 0, "medium": 1, "low": 2}
+    ordered = sorted(gaps, key=lambda gap: priority.get(gap.get("priority"), 3))
+    high_priority = [gap for gap in ordered if gap.get("priority") == "high"]
+    other = [gap for gap in ordered if gap.get("priority") != "high"]
+    if len(high_priority) > 1:
+        offset = max(state.get("research_loop_count", 0) - 1, 0) % len(high_priority)
+        high_priority = high_priority[offset:] + high_priority[:offset]
+    return [*high_priority, *other]
+
+
+def _source_rank_key(source: Mapping[str, Any]) -> tuple:
+    """Rank sources by requested fit, acceptance, primacy, authority, and score."""
+    return (
+        bool(source.get("matches_requested_source_type")),
+        source.get("quality_status") == "accepted",
+        bool(source.get("is_primary_source")),
+        bool(source.get("is_authoritative_source")),
+        float(source.get("evidence_score", 0)),
+    )
+
+
+def _gap_has_required_source(
+    gap: Mapping[str, Any], sources: Sequence[Mapping[str, Any]]
+) -> bool:
+    """Check that a gap has accepted evidence of one requested source type."""
+    gap_id = gap.get("gap_id", "")
+    if gap_id == "quality-accepted-sources":
+        return any(source.get("quality_status") == "accepted" for source in sources)
+    if gap_id == "quality-authoritative-source":
+        return any(
+            source.get("quality_status") == "accepted"
+            and source.get("is_authoritative_source")
+            for source in sources
+        )
+    if gap_id == "quality-primary-source":
+        return any(
+            source.get("quality_status") == "accepted"
+            and source.get("is_primary_source")
+            for source in sources
+        )
+    required_types = set(gap.get("required_source_types", []))
+    return any(
+        source.get("quality_status") == "accepted"
+        and gap_id in source.get("gap_ids", [])
+        and (not required_types or source.get("source_type", "") in required_types)
+        for source in sources
+    )
 
 
 def emit_research_event(event_type: str, **data):
@@ -281,7 +378,7 @@ def dispatch_research_dimensions(state: OverallState):
                 "initial_search_query_count": state.get(
                     "initial_search_query_count", 3
                 ),
-                "max_research_loops": state.get("max_research_loops", 2),
+                "max_research_loops": state.get("max_research_loops", 3),
             },
         )
         for dimension in state["research_dimensions"]
@@ -298,7 +395,7 @@ def generate_query(
         or configurable.number_of_initial_queries
     )
     assessment = state.get("reflection_assessment", {})
-    gaps = assessment.get("missing_questions", [])
+    gaps = _prioritized_gaps(state)
     required_source_types = sorted(
         {
             source_type
@@ -316,6 +413,7 @@ def generate_query(
         dimension_scope=state["dimension"]["scope"],
         knowledge_gap=state.get("current_knowledge_gap")
         or "None; this is the first pass.",
+        gap_records=json.dumps(gaps, ensure_ascii=False),
         required_source_types=required_source_types or "No special requirement.",
         recommended_search_strategy=strategies or "No special strategy.",
         query_history=[*query_history, *do_not_repeat]
@@ -342,11 +440,25 @@ def generate_query(
         queries = [query.strip() for query in result.query if query.strip()][:1]
     if not queries:
         raise ValueError("DeepSeek did not generate any usable search queries")
+    search_tasks = []
+    for index, query in enumerate(queries):
+        gap = gaps[index % len(gaps)]
+        search_tasks.append(
+            {
+                "query": query,
+                "gap_id": gap.get("gap_id", "initial-dimension-scope"),
+                "requested_source_types": gap.get("required_source_types", [])
+                or _default_source_types(state["research_topic"], state["dimension"]),
+                "expected_evidence": gap.get("expected_evidence")
+                or gap.get("reason", ""),
+            }
+        )
     emit_research_event(
         "queries_generated",
         research_run_id=state["research_run_id"],
         dimension=state["dimension"],
         queries=queries,
+        search_tasks=search_tasks,
         loop=state.get("research_loop_count", 0),
     )
     return {
@@ -354,6 +466,7 @@ def generate_query(
         "research_topic": state["research_topic"],
         "dimension": state["dimension"],
         "search_query": queries,
+        "search_tasks": search_tasks,
         "query_history": queries,
         "research_loop_count": state.get("research_loop_count", 0),
     }
@@ -365,15 +478,18 @@ def dispatch_search_queries(state: QueryGenerationState):
         Send(
             "web_research",
             {
-                "search_query": query,
+                "search_query": task["query"],
                 "research_run_id": state["research_run_id"],
                 "search_id": (
                     f"{state['research_run_id']}-{state['dimension']['id']}-"
                     f"{state['research_loop_count']}-{index}"
                 ),
+                "gap_id": task["gap_id"],
+                "requested_source_types": task["requested_source_types"],
+                "expected_evidence": task["expected_evidence"],
             },
         )
-        for index, query in enumerate(state["search_query"])
+        for index, task in enumerate(state["search_tasks"])
     ]
 
 
@@ -420,6 +536,10 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> DimensionStat
         )
         return {
             "sources_gathered": [],
+            "search_failures": [
+                f"{state['search_query']}: "
+                + (str(last_error) if last_error else "Unknown Tavily error")
+            ],
             "web_research_result": [
                 f"Search failed for query: {state['search_query']}. No evidence was added."
             ],
@@ -431,6 +551,16 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> DimensionStat
         state["search_id"],
         state["research_run_id"],
     )
+    sources = [
+        {
+            **source,
+            "gap_id": state.get("gap_id", ""),
+            "gap_ids": [state["gap_id"]] if state.get("gap_id") else [],
+            "requested_source_types": state.get("requested_source_types", []),
+            "expected_evidence": state.get("expected_evidence", ""),
+        }
+        for source in sources
+    ]
     emit_research_event(
         "search_completed",
         query=state["search_query"],
@@ -439,6 +569,7 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> DimensionStat
     )
     return {
         "sources_gathered": sources,
+        "search_success_count": 1,
         "web_research_result": [format_sources_for_research(sources)],
     }
 
@@ -529,14 +660,22 @@ def evaluate_sources(state: DimensionState, config: RunnableConfig):
             source_type = assessment.source_type
             supported_topics = assessment.supported_topics
             rejection_reasons = assessment.rejection_reasons
-        search_score = source.get("score")
-        normalized_search_score = normalize_search_score(search_score)
+        requested_source_types = source.get("requested_source_types", [])
+        matches_requested_source_type = (
+            not requested_source_types or source_type in requested_source_types
+        )
+        content_completeness_score = max(
+            0.25, min(len(source.get("content", "")) / 1200, 1)
+        )
+        is_authoritative_source = (
+            source_type in AUTHORITATIVE_SOURCE_TYPES and authority >= 0.7
+        )
         evidence_score = (
-            relevance * 0.4
-            + authority * 0.25
-            + recency * 0.15
-            + (0.1 if primary else 0.0)
-            + normalized_search_score * 0.1
+            relevance * 0.35
+            + authority * 0.30
+            + (0.15 if primary else 0.0)
+            + recency * 0.10
+            + content_completeness_score * 0.10
         )
         if assessment is None:
             quality_status = "rejected"
@@ -561,12 +700,13 @@ def evaluate_sources(state: DimensionState, config: RunnableConfig):
                 "supported_topics": supported_topics,
                 "rejection_reasons": rejection_reasons,
                 "quality_status": quality_status,
+                "matches_requested_source_type": matches_requested_source_type,
+                "content_completeness_score": content_completeness_score,
+                "is_authoritative_source": is_authoritative_source,
             }
         )
     domain_counts: dict[str, int] = {}
-    for source in sorted(
-        evaluated, key=lambda item: item["evidence_score"], reverse=True
-    ):
+    for source in sorted(evaluated, key=_source_rank_key, reverse=True):
         if source["quality_status"] == "rejected":
             continue
         domain = source.get("domain", "")
@@ -584,10 +724,7 @@ def evaluate_sources(state: DimensionState, config: RunnableConfig):
             for source in evaluated
             if source["quality_status"] in {"accepted", "supplementary"}
         ),
-        key=lambda item: (
-            item["quality_status"] == "accepted",
-            item["evidence_score"],
-        ),
+        key=_source_rank_key,
         reverse=True,
     )
     for source in quality_ranked[configurable.max_selected_sources_per_dimension :]:
@@ -596,11 +733,15 @@ def evaluate_sources(state: DimensionState, config: RunnableConfig):
             *source["rejection_reasons"],
             "The per-dimension evidence budget was reached.",
         ]
-    selected = [
-        source
-        for source in evaluated
-        if source["quality_status"] in {"accepted", "supplementary"}
-    ]
+    selected = sorted(
+        (
+            source
+            for source in evaluated
+            if source["quality_status"] in {"accepted", "supplementary"}
+        ),
+        key=_source_rank_key,
+        reverse=True,
+    )
     rejected = [
         source for source in evaluated if source["quality_status"] == "rejected"
     ]
@@ -630,6 +771,34 @@ def reflection(state: DimensionState, config: RunnableConfig):
     """Produce a structured evidence audit and deterministic completion status."""
     configurable = Configuration.from_runnable_config(config)
     loop_count = state.get("research_loop_count", 0) + 1
+    selected_sources = state.get("selected_sources", [])
+    accepted_count = sum(
+        source.get("quality_status") == "accepted" for source in selected_sources
+    )
+    authoritative_count = sum(
+        source.get("quality_status") == "accepted"
+        and bool(source.get("is_authoritative_source"))
+        for source in selected_sources
+    )
+    primary_count = sum(
+        source.get("quality_status") == "accepted"
+        and bool(source.get("is_primary_source"))
+        for source in selected_sources
+    )
+    current_source_ids = sorted(source["source_id"] for source in selected_sources)
+    source_id_history = state.get("evidence_source_id_history", [])
+    previous_source_ids = set(source_id_history[-1]) if source_id_history else set()
+    new_source_ids = set(current_source_ids) - previous_source_ids
+    minimum_source_requirements = {
+        "accepted": configurable.min_accepted_sources_per_dimension,
+        "authoritative": configurable.min_authoritative_sources_per_dimension,
+        "primary": configurable.min_primary_sources_per_dimension,
+        "current": {
+            "accepted": accepted_count,
+            "authoritative": authoritative_count,
+            "primary": primary_count,
+        },
+    }
     prompt = reflection_instructions.format(
         research_topic=state["research_topic"],
         dimension_title=state["dimension"]["title"],
@@ -642,6 +811,16 @@ def reflection(state: DimensionState, config: RunnableConfig):
             state.get("reflection_history", [])[-1:] or [], ensure_ascii=False
         ),
         query_history=state.get("query_history", []) or "None.",
+        evidence_gain_history=json.dumps(
+            [
+                *state.get("evidence_gain_history", []),
+                {"new_source_count": len(new_source_ids)},
+            ][-3:],
+            ensure_ascii=False,
+        ),
+        minimum_source_requirements=json.dumps(
+            minimum_source_requirements, ensure_ascii=False
+        ),
     )
     llm = create_deepseek_model(configurable.reflection_model)
     try:
@@ -664,6 +843,7 @@ def reflection(state: DimensionState, config: RunnableConfig):
                     "reason": "The structured reflection could not be parsed safely.",
                     "priority": "high",
                     "required_source_types": [],
+                    "expected_evidence": state["dimension"]["scope"],
                     "suggested_query_focus": state["dimension"]["scope"],
                 }
             ],
@@ -679,49 +859,218 @@ def reflection(state: DimensionState, config: RunnableConfig):
             completion_reason="Reflection parsing failed, so evidence cannot be declared sufficient.",
             confidence=0.0,
         )
+    missing_questions = list(result.missing_questions)
+    if not result.is_sufficient and not missing_questions:
+        missing_questions.append(
+            ResearchGap(
+                gap_id="reflection-unresolved-evidence",
+                question=f"What material evidence is still missing for {state['dimension']['title']}?",
+                reason=result.completion_reason
+                or "The reflection did not declare the dimension sufficient.",
+                priority="high",
+                required_source_types=_default_source_types(
+                    state["research_topic"], state["dimension"]
+                ),
+                expected_evidence="Direct evidence that resolves the remaining uncertainty or conflict.",
+                suggested_query_focus=(
+                    result.recommended_search_strategy[0]
+                    if result.recommended_search_strategy
+                    else state["dimension"]["scope"]
+                ),
+            )
+        )
+    quality_gaps = []
+    if accepted_count < configurable.min_accepted_sources_per_dimension:
+        quality_gaps.append(
+            ResearchGap(
+                gap_id="quality-accepted-sources",
+                question="Which additional relevant sources can independently support this dimension?",
+                reason="The minimum accepted-source requirement has not been met.",
+                priority="high",
+                required_source_types=sorted(AUTHORITATIVE_SOURCE_TYPES),
+                expected_evidence="Independent relevant evidence from an accepted source.",
+                suggested_query_focus="Find additional authoritative evidence for the dimension.",
+            )
+        )
+    if authoritative_count < configurable.min_authoritative_sources_per_dimension:
+        quality_gaps.append(
+            ResearchGap(
+                gap_id="quality-authoritative-source",
+                question="What authoritative source directly addresses this dimension?",
+                reason="No sufficient authoritative evidence has been selected.",
+                priority="high",
+                required_source_types=sorted(AUTHORITATIVE_SOURCE_TYPES),
+                expected_evidence="A direct statement or data point from an authoritative source.",
+                suggested_query_focus="Search official, academic, standards, or institutional sources.",
+            )
+        )
+    if primary_count < configurable.min_primary_sources_per_dimension:
+        quality_gaps.append(
+            ResearchGap(
+                gap_id="quality-primary-source",
+                question="What primary source directly supports this dimension?",
+                reason="The minimum primary-source requirement has not been met.",
+                priority="high",
+                required_source_types=[
+                    "government",
+                    "official_company",
+                    "standards_body",
+                    "academic",
+                ],
+                expected_evidence="First-party data, documentation, regulation, or research text.",
+                suggested_query_focus="Find the original official document, dataset, or publication.",
+            )
+        )
+    prior_history = state.get("reflection_history", [])
+    prior_gap_values = [
+        gap
+        for item in prior_history[-1:]
+        for gap in item.get("missing_questions", [])
+        if gap.get("gap_id")
+    ]
+    prior_gap_by_id = {gap["gap_id"]: gap for gap in prior_gap_values}
+    requested_resolved_ids = set(result.resolved_gap_ids) & set(prior_gap_by_id)
+    validated_model_resolved_ids = {
+        gap_id
+        for gap_id in requested_resolved_ids
+        if _gap_has_required_source(prior_gap_by_id[gap_id], selected_sources)
+    }
+    rejected_resolved_ids = requested_resolved_ids - validated_model_resolved_ids
+    requirement_resolved_ids = set()
+    if accepted_count >= configurable.min_accepted_sources_per_dimension:
+        requirement_resolved_ids.add("quality-accepted-sources")
+    if authoritative_count >= configurable.min_authoritative_sources_per_dimension:
+        requirement_resolved_ids.add("quality-authoritative-source")
+    if primary_count >= configurable.min_primary_sources_per_dimension:
+        requirement_resolved_ids.add("quality-primary-source")
+    gaps_by_id = {gap.gap_id: gap for gap in missing_questions}
+    gaps_by_id.update({gap.gap_id: gap for gap in quality_gaps})
+    for prior_gap in prior_gap_values:
+        gap_id = prior_gap["gap_id"]
+        if gap_id in validated_model_resolved_ids or gap_id in requirement_resolved_ids:
+            continue
+        gaps_by_id.setdefault(gap_id, ResearchGap.model_validate(prior_gap))
+    missing_questions = list(gaps_by_id.values())
+    assessment = result.model_dump()
+    assessment["missing_questions"] = [gap.model_dump() for gap in missing_questions]
+    if any(gap.priority == "high" for gap in missing_questions):
+        assessment["is_sufficient"] = False
+    if quality_gaps:
+        assessment["source_quality_issues"] = list(
+            dict.fromkeys(
+                [
+                    *assessment.get("source_quality_issues", []),
+                    "Deterministic minimum source requirements are not met.",
+                ]
+            )
+        )
+    if rejected_resolved_ids:
+        assessment["source_quality_issues"] = list(
+            dict.fromkeys(
+                [
+                    *assessment.get("source_quality_issues", []),
+                    "Resolved gaps were retained because no accepted source of the requested type was associated with them: "
+                    + ", ".join(sorted(rejected_resolved_ids)),
+                ]
+            )
+        )
+    prior_missing_ids = {
+        gap.get("gap_id", "")
+        for item in prior_history[-1:]
+        for gap in item.get("missing_questions", [])
+        if gap.get("gap_id")
+    }
+    current_gap_ids = {gap.gap_id for gap in missing_questions}
+    declared_resolved_ids = validated_model_resolved_ids & (
+        set(state.get("gap_registry", {})) | prior_missing_ids
+    )
+    deterministically_resolved_ids = requirement_resolved_ids & (
+        set(state.get("gap_registry", {})) | prior_missing_ids
+    )
+    newly_resolved_ids = (
+        declared_resolved_ids | deterministically_resolved_ids
+    ) - current_gap_ids
+    # A model may reopen a previously resolved gap when later evidence exposes a
+    # new uncertainty. Current missing gaps are therefore authoritative over the
+    # historical resolved set.
+    resolved_gap_ids = (
+        set(state.get("resolved_gap_ids", [])) | newly_resolved_ids
+    ) - current_gap_ids
+    gap_registry = dict(state.get("gap_registry", {}))
+    for item in missing_questions:
+        gap_registry[item.gap_id] = item.model_dump()
+    gap_source_coverage_ids = {
+        gap_id
+        for gap_id, gap in gap_registry.items()
+        if _gap_has_required_source(gap, selected_sources)
+    }
+    evidence_gain = {
+        "loop": loop_count,
+        "new_source_count": len(new_source_ids),
+        "new_accepted_source_count": sum(
+            source["source_id"] in new_source_ids
+            and source.get("quality_status") == "accepted"
+            for source in selected_sources
+        ),
+        "new_primary_source_count": sum(
+            source["source_id"] in new_source_ids
+            and bool(source.get("is_primary_source"))
+            for source in selected_sources
+        ),
+        "resolved_gap_count": len(newly_resolved_ids),
+    }
+    evidence_gain["total_gain"] = (
+        evidence_gain["new_source_count"] + evidence_gain["resolved_gap_count"]
+    )
     knowledge_gap = "\n".join(
-        f"{gap.question}: {gap.reason}. Search focus: {gap.suggested_query_focus}"
-        for gap in result.missing_questions
+        f"[{gap.gap_id}] {gap.question}: {gap.reason}. "
+        f"Expected evidence: {gap.expected_evidence}. "
+        f"Search focus: {gap.suggested_query_focus}"
+        for gap in missing_questions
     )
     emit_research_event(
         "reflection_completed",
         research_run_id=state["research_run_id"],
         dimension=state["dimension"],
-        is_sufficient=result.is_sufficient,
+        is_sufficient=assessment["is_sufficient"],
         knowledge_gap=knowledge_gap,
-        missing_questions=[gap.model_dump() for gap in result.missing_questions],
+        missing_questions=[gap.model_dump() for gap in missing_questions],
         contradictions=[item.model_dump() for item in result.contradictions],
         confidence=result.confidence,
         loop=loop_count,
+        evidence_gain=evidence_gain,
     )
-    assessment = result.model_dump()
-    prior_history = state.get("reflection_history", [])
-    current_gap_keys = {
-        gap.question.casefold().strip() for gap in result.missing_questions
-    }
-    prior_gap_keys = {
-        gap.get("question", "").casefold().strip()
-        for item in prior_history[-1:]
-        for gap in item.get("missing_questions", [])
-    }
-    source_counts = state.get("evidence_source_count_history", [])
+    gain_history = state.get("evidence_gain_history", [])
     stalled = bool(
-        prior_history
-        and current_gap_keys
-        and current_gap_keys == prior_gap_keys
-        and source_counts
-        and len(state.get("selected_sources", [])) <= source_counts[-1]
+        gain_history
+        and gain_history[-1].get("total_gain", 0) == 0
+        and evidence_gain["total_gain"] == 0
     )
-    high_priority_gap = any(gap.priority == "high" for gap in result.missing_questions)
+    high_priority_gap = any(gap.priority == "high" for gap in missing_questions) or any(
+        gap_id not in resolved_gap_ids and gap.get("priority") == "high"
+        for gap_id, gap in gap_registry.items()
+    )
     unresolved_conflict = any(item.requires_follow_up for item in result.contradictions)
-    if result.is_sufficient and not high_priority_gap and not unresolved_conflict:
+    search_unavailable = bool(
+        not selected_sources
+        and state.get("search_failures")
+        and state.get("search_success_count", 0) == 0
+    )
+    if search_unavailable:
+        completion_status = "search_unavailable"
+        is_sufficient = False
+    elif (
+        assessment["is_sufficient"]
+        and not high_priority_gap
+        and not unresolved_conflict
+    ):
         completion_status = "sufficient"
         is_sufficient = True
-    elif loop_count >= state["max_research_loops"]:
-        completion_status = "loop_limit_reached"
-        is_sufficient = False
     elif stalled:
         completion_status = "stalled"
+        is_sufficient = False
+    elif loop_count >= state["max_research_loops"]:
+        completion_status = "budget_exhausted"
         is_sufficient = False
     else:
         completion_status = "researching"
@@ -733,6 +1082,11 @@ def reflection(state: DimensionState, config: RunnableConfig):
         "reflection_assessment": assessment,
         "reflection_history": [assessment],
         "evidence_source_count_history": [len(state.get("selected_sources", []))],
+        "evidence_source_id_history": [current_source_ids],
+        "evidence_gain_history": [evidence_gain],
+        "gap_registry": gap_registry,
+        "resolved_gap_ids": sorted(resolved_gap_ids),
+        "gap_source_coverage_ids": sorted(gap_source_coverage_ids),
         "completion_status": completion_status,
     }
 
@@ -748,6 +1102,19 @@ def extract_claims(state: DimensionState, config: RunnableConfig):
     """Convert selected evidence into an auditable claim set."""
     configurable = Configuration.from_runnable_config(config)
     selected = state.get("selected_sources", [])
+    if not selected:
+        emit_research_event(
+            "claims_extracted",
+            research_run_id=state["research_run_id"],
+            dimension=state["dimension"],
+            claim_count=0,
+            invalid_evidence_count=0,
+        )
+        return {
+            "claims": [],
+            "dimension_summary": "No claim was extracted because no quality-screened evidence was available.",
+        }
+
     def build_prompt(sources, content_chars, max_claims):
         return claim_extraction_instructions.format(
             research_topic=state["research_topic"],
@@ -768,6 +1135,27 @@ def extract_claims(state: DimensionState, config: RunnableConfig):
     structured_model = create_deepseek_model(
         configurable.reflection_model
     ).with_structured_output(ClaimExtraction, method="json_mode")
+
+    def compact_retry(reason: str):
+        retry_source_limit = min(len(selected), 6)
+        retry_claim_limit = min(configurable.max_claims_per_dimension, 8)
+        emit_research_event(
+            "claim_extraction_retry",
+            research_run_id=state["research_run_id"],
+            dimension=state["dimension"],
+            reason=reason,
+            source_count=retry_source_limit,
+            max_claims=retry_claim_limit,
+        )
+        return structured_model.invoke(
+            build_prompt(
+                selected[:retry_source_limit],
+                min(configurable.max_claim_source_chars, 1000),
+                retry_claim_limit,
+            )
+            + "\nReturn only claims with verbatim quote text copied from Content."
+        )
+
     try:
         result = structured_model.invoke(
             build_prompt(
@@ -776,63 +1164,114 @@ def extract_claims(state: DimensionState, config: RunnableConfig):
                 configurable.max_claims_per_dimension,
             )
         )
-    except LengthFinishReasonError:
-        # A concise second pass is preferable to failing the complete dimension when
-        # DeepSeek consumes its response budget on a large evidence collection.
-        retry_source_limit = min(len(selected), 6)
-        retry_claim_limit = min(configurable.max_claims_per_dimension, 8)
-        emit_research_event(
-            "claim_extraction_retry",
-            research_run_id=state["research_run_id"],
-            dimension=state["dimension"],
-            reason="length_limit",
-            source_count=retry_source_limit,
-            max_claims=retry_claim_limit,
+    except (LengthFinishReasonError, OutputParserException) as error:
+        reason = (
+            "length_limit"
+            if isinstance(error, LengthFinishReasonError)
+            else "structured_output_failure"
         )
-        result = structured_model.invoke(
-            build_prompt(
-                selected[:retry_source_limit],
-                min(configurable.max_claim_source_chars, 1000),
-                retry_claim_limit,
+        try:
+            result = compact_retry(reason)
+        except (LengthFinishReasonError, OutputParserException) as retry_error:
+            emit_research_event(
+                "claim_extraction_failed",
+                research_run_id=state["research_run_id"],
+                dimension=state["dimension"],
+                error=f"{type(retry_error).__name__}: {retry_error}",
             )
-        )
-    valid_ids = {source["source_id"] for source in selected}
-    source_by_id = {source["source_id"]: source for source in selected}
-    claims = []
-    for claim in result.claims[: configurable.max_claims_per_dimension]:
-        supporting_ids = [
-            source_id
-            for source_id in claim.source_ids
-            if source_id in valid_ids
-        ]
-        contradicting_ids = [
-            source_id
-            for source_id in claim.counter_source_ids
-            if source_id in valid_ids
-        ]
-        if not supporting_ids:
-            continue
-        supporting_evidence = " ".join(
-            source_by_id[source_id]["content"][:400].strip()
-            for source_id in supporting_ids
-        )
-        claims.append(
-            {
-                "claim": claim.claim,
-                "supporting_source_ids": supporting_ids,
-                "supporting_evidence": supporting_evidence,
-                "contradicting_source_ids": contradicting_ids,
-                "confidence": 0.5,
-                "uncertainty_reason": claim.uncertainty,
+            return {
+                "claims": [],
+                "dimension_summary": "No claim passed structured evidence extraction.",
             }
-        )
+    source_by_id = {source["source_id"]: source for source in selected}
+
+    def validate_extraction(extraction):
+        validated_claims = []
+        invalid_count = 0
+        for claim in extraction.claims[: configurable.max_claims_per_dimension]:
+            evidence_groups = []
+            for evidence_items in (claim.evidence, claim.counter_evidence):
+                verified = []
+                for evidence in evidence_items:
+                    source = source_by_id.get(evidence.source_id)
+                    located = (
+                        locate_evidence_quote(
+                            source["content"],
+                            evidence.quote,
+                            min_chars=configurable.min_evidence_quote_chars,
+                        )
+                        if source
+                        else None
+                    )
+                    if located is None:
+                        invalid_count += 1
+                        continue
+                    quote, locator = located
+                    verified.append(
+                        {
+                            "source_id": evidence.source_id,
+                            "quote": quote,
+                            "locator": locator,
+                        }
+                    )
+                evidence_groups.append(verified)
+            supporting_evidence, contradicting_evidence = evidence_groups
+            if not supporting_evidence:
+                continue
+            validated_claims.append(
+                {
+                    "claim": claim.claim,
+                    "supporting_source_ids": list(
+                        dict.fromkeys(item["source_id"] for item in supporting_evidence)
+                    ),
+                    "supporting_evidence": supporting_evidence,
+                    "contradicting_source_ids": list(
+                        dict.fromkeys(
+                            item["source_id"] for item in contradicting_evidence
+                        )
+                    ),
+                    "contradicting_evidence": contradicting_evidence,
+                    "confidence": claim.confidence,
+                    "uncertainty_reason": claim.uncertainty,
+                }
+            )
+        return validated_claims, invalid_count
+
+    claims, invalid_evidence_count = validate_extraction(result)
+    dimension_summary = result.summary
+    minimum_expected_claims = max(1, (len(result.claims) + 1) // 2)
+    if selected and invalid_evidence_count and len(claims) < minimum_expected_claims:
+        try:
+            repaired_result = compact_retry("invalid_evidence_quotes")
+        except (LengthFinishReasonError, OutputParserException) as repair_error:
+            emit_research_event(
+                "claim_evidence_repair_failed",
+                research_run_id=state["research_run_id"],
+                dimension=state["dimension"],
+                error=f"{type(repair_error).__name__}: {repair_error}",
+            )
+        else:
+            repaired_claims, repaired_invalid_count = validate_extraction(
+                repaired_result
+            )
+            if repaired_claims:
+                dimension_summary = repaired_result.summary
+            invalid_evidence_count += repaired_invalid_count
+            claims_by_text = {claim["claim"].casefold(): claim for claim in claims}
+            claims_by_text.update(
+                {claim["claim"].casefold(): claim for claim in repaired_claims}
+            )
+            claims = list(claims_by_text.values())[
+                : configurable.max_claims_per_dimension
+            ]
     emit_research_event(
         "claims_extracted",
         research_run_id=state["research_run_id"],
         dimension=state["dimension"],
         claim_count=len(claims),
+        invalid_evidence_count=invalid_evidence_count,
     )
-    return {"claims": claims, "dimension_summary": result.summary}
+    return {"claims": claims, "dimension_summary": dimension_summary}
 
 
 dimension_builder = StateGraph(DimensionState, input_schema=DimensionInput)
@@ -884,6 +1323,27 @@ def research_dimension(state: DimensionInput, config: RunnableConfig):
         ),
         "confidence": result["reflection_assessment"].get("confidence", 0),
         "claims": result.get("claims", []),
+        "known_gap_count": len(result.get("gap_registry", {})),
+        "resolved_gap_count": len(
+            set(result.get("resolved_gap_ids", []))
+            & set(result.get("gap_registry", {}))
+        ),
+        "high_priority_gap_count": sum(
+            gap.get("priority") == "high"
+            for gap in result.get("gap_registry", {}).values()
+        ),
+        "resolved_high_priority_gap_count": sum(
+            gap_id in set(result.get("resolved_gap_ids", []))
+            and gap.get("priority") == "high"
+            for gap_id, gap in result.get("gap_registry", {}).items()
+        ),
+        "high_priority_gap_source_coverage_count": sum(
+            gap_id in set(result.get("gap_source_coverage_ids", []))
+            and gap.get("priority") == "high"
+            for gap_id, gap in result.get("gap_registry", {}).items()
+        ),
+        "evidence_gain_history": result.get("evidence_gain_history", []),
+        "search_failure_count": len(result.get("search_failures", [])),
     }
     emit_research_event(
         "dimension_completed",

@@ -18,9 +18,20 @@ def test_source_quality_limits_are_configurable():
         max_selected_sources_per_dimension=8,
         max_sources_per_domain=3,
         max_claims_per_dimension=10,
+        min_accepted_sources_per_dimension=3,
     )
 
     assert configuration.max_source_candidates_per_dimension == 25
     assert configuration.max_selected_sources_per_dimension == 8
     assert configuration.max_sources_per_domain == 3
     assert configuration.max_claims_per_dimension == 10
+    assert configuration.min_accepted_sources_per_dimension == 3
+
+
+def test_quality_defaults_allow_adaptive_research():
+    configuration = Configuration()
+
+    assert configuration.max_research_loops == 3
+    assert configuration.min_accepted_sources_per_dimension == 2
+    assert configuration.min_authoritative_sources_per_dimension == 1
+    assert configuration.min_primary_sources_per_dimension == 1

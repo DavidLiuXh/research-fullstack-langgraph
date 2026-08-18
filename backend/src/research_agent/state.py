@@ -39,13 +39,27 @@ class ResearchSource(TypedDict):
     supported_topics: NotRequired[list[str]]
     rejection_reasons: NotRequired[list[str]]
     quality_status: NotRequired[str]
+    gap_id: NotRequired[str]
+    gap_ids: NotRequired[list[str]]
+    requested_source_types: NotRequired[list[str]]
+    expected_evidence: NotRequired[str]
+    matches_requested_source_type: NotRequired[bool]
+    content_completeness_score: NotRequired[float]
+    is_authoritative_source: NotRequired[bool]
+
+
+class EvidenceQuote(TypedDict):
+    source_id: str
+    quote: str
+    locator: str
 
 
 class EvidenceClaim(TypedDict):
     claim: str
     supporting_source_ids: list[str]
-    supporting_evidence: str
+    supporting_evidence: list[EvidenceQuote]
     contradicting_source_ids: list[str]
+    contradicting_evidence: list[EvidenceQuote]
     confidence: float
     uncertainty_reason: str
 
@@ -64,6 +78,13 @@ class DimensionResult(TypedDict):
     source_quality_issues: list[str]
     confidence: float
     claims: list[EvidenceClaim]
+    known_gap_count: int
+    resolved_gap_count: int
+    high_priority_gap_count: int
+    resolved_high_priority_gap_count: int
+    high_priority_gap_source_coverage_count: int
+    evidence_gain_history: list[dict]
+    search_failure_count: int
 
 
 class OverallState(TypedDict):
@@ -105,12 +126,20 @@ class DimensionState(TypedDict):
     research_loop_count: int
     is_sufficient: bool
     query_history: Annotated[list[str], operator.add]
+    search_tasks: list[dict]
+    search_failures: Annotated[list[str], operator.add]
+    search_success_count: Annotated[int, operator.add]
     evaluated_sources: list[ResearchSource]
     selected_sources: list[ResearchSource]
     rejected_sources: list[ResearchSource]
     reflection_assessment: dict
     reflection_history: Annotated[list[dict], operator.add]
     evidence_source_count_history: Annotated[list[int], operator.add]
+    evidence_source_id_history: Annotated[list[list[str]], operator.add]
+    evidence_gain_history: Annotated[list[dict], operator.add]
+    gap_registry: dict[str, dict]
+    resolved_gap_ids: list[str]
+    gap_source_coverage_ids: list[str]
     completion_status: str
     claims: list[EvidenceClaim]
     dimension_summary: str
@@ -129,6 +158,7 @@ class QueryGenerationState(TypedDict):
     research_topic: str
     dimension: ResearchDimension
     search_query: list[str]
+    search_tasks: list[dict]
     research_loop_count: int
     query_history: Annotated[list[str], operator.add]
 
@@ -137,3 +167,6 @@ class WebSearchState(TypedDict):
     research_run_id: str
     search_query: str
     search_id: str
+    gap_id: str
+    requested_source_types: list[str]
+    expected_evidence: str

@@ -1,6 +1,42 @@
+import hashlib
+import re
+import unicodedata
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+SOURCE_TYPE_VALUES = {
+    "government",
+    "academic",
+    "official_company",
+    "standards_body",
+    "international_organization",
+    "industry_association",
+    "research_institute",
+    "major_media",
+    "specialist_media",
+    "commercial_report",
+    "blog",
+    "forum",
+    "aggregator",
+    "unknown",
+}
+SOURCE_TYPE_ALIASES = {
+    "official documentation": "official_company",
+    "official docs": "official_company",
+    "vendor documentation": "official_company",
+    "official repository": "official_company",
+    "github": "official_company",
+    "government website": "government",
+    "regulator": "government",
+    "official statistics": "government",
+    "academic paper": "academic",
+    "research paper": "academic",
+    "peer reviewed": "academic",
+    "standards": "standards_body",
+    "standard": "standards_body",
+    "industry report": "research_institute",
+}
 
 
 class TopicClarificationAssessment(BaseModel):
@@ -117,10 +153,12 @@ class SourceAssessmentList(BaseModel):
 
 
 class ResearchGap(BaseModel):
+    gap_id: str = ""
     question: str
     reason: str
     priority: Literal["high", "medium", "low"]
     required_source_types: list[str]
+    expected_evidence: str = ""
     suggested_query_focus: str
 
     @model_validator(mode="before")
@@ -138,9 +176,32 @@ class ResearchGap(BaseModel):
         normalized.setdefault(
             "required_source_types", normalized.pop("source_types", [])
         )
+        source_types = normalized.get("required_source_types") or []
+        if isinstance(source_types, str):
+            source_types = [source_types]
+        normalized["required_source_types"] = list(
+            dict.fromkeys(
+                source_type
+                if source_type in SOURCE_TYPE_VALUES
+                else SOURCE_TYPE_ALIASES.get(source_type.casefold().strip(), "unknown")
+                for item in source_types
+                for source_type in [str(item).casefold().strip()]
+            )
+        )
         normalized.setdefault(
             "suggested_query_focus", normalized.pop("search_focus", "")
         )
+        normalized.setdefault(
+            "expected_evidence",
+            normalized.pop("evidence_needed", normalized.get("reason", "")),
+        )
+        if not normalized.get("gap_id"):
+            question = unicodedata.normalize(
+                "NFKC", str(normalized.get("question", ""))
+            ).casefold()
+            question = re.sub(r"\s+", " ", question).strip()
+            digest = hashlib.sha1(question.encode("utf-8")).hexdigest()[:10]
+            normalized["gap_id"] = f"gap-{digest}"
         return normalized
 
 
@@ -156,6 +217,7 @@ class Reflection(BaseModel):
         description="Whether the evidence is sufficient for this research dimension."
     )
     covered_questions: list[str]
+    resolved_gap_ids: list[str] = Field(default_factory=list)
     missing_questions: list[ResearchGap] = Field(max_length=3)
     unsupported_claims: list[str]
     contradictions: list[EvidenceConflict]
@@ -174,6 +236,7 @@ class Reflection(BaseModel):
         normalized = dict(value)
         normalized.setdefault("is_sufficient", normalized.pop("sufficient", False))
         normalized.setdefault("covered_questions", [])
+        normalized.setdefault("resolved_gap_ids", [])
         normalized.setdefault("missing_questions", [])
         normalized.setdefault("unsupported_claims", [])
         normalized.setdefault("contradictions", [])
@@ -214,11 +277,47 @@ class Reflection(BaseModel):
         return self
 
 
+class EvidenceQuote(BaseModel):
+    """A verbatim excerpt attributed to one selected source."""
+
+    source_id: str
+    quote: str = ""
+    locator: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_quote_aliases(cls, value):
+        """Normalize common evidence quote aliases from model providers."""
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        normalized.setdefault(
+            "quote", normalized.pop("excerpt", normalized.pop("text", ""))
+        )
+        normalized.setdefault(
+            "locator", normalized.pop("location", normalized.pop("section", ""))
+        )
+        return normalized
+
+
 class EvidenceClaim(BaseModel):
+    """A factual claim backed by directly quoted selected evidence."""
+
     claim: str
-    source_ids: list[str]
-    counter_source_ids: list[str] = Field(default_factory=list)
+    evidence: list[EvidenceQuote] = Field(default_factory=list)
+    counter_evidence: list[EvidenceQuote] = Field(default_factory=list)
     uncertainty: str = ""
+    confidence: float = Field(default=0.5, ge=0, le=1)
+
+    @property
+    def source_ids(self) -> list[str]:
+        """Expose supporting source IDs for rolling compatibility."""
+        return list(dict.fromkeys(item.source_id for item in self.evidence))
+
+    @property
+    def counter_source_ids(self) -> list[str]:
+        """Expose counter-source IDs for rolling compatibility."""
+        return list(dict.fromkeys(item.source_id for item in self.counter_evidence))
 
     @model_validator(mode="before")
     @classmethod
@@ -227,19 +326,59 @@ class EvidenceClaim(BaseModel):
         if not isinstance(value, dict):
             return value
         normalized = dict(value)
-        normalized.setdefault(
+        evidence = normalized.pop("supporting_evidence", normalized.get("evidence", []))
+        source_ids = normalized.pop(
             "source_ids", normalized.pop("supporting_source_ids", [])
         )
-        normalized.setdefault(
+        if isinstance(evidence, dict):
+            evidence = [
+                {"source_id": source_id, "quote": quote}
+                for source_id, quote in evidence.items()
+            ]
+        if not isinstance(evidence, list):
+            evidence = []
+        if evidence and all(isinstance(item, str) for item in evidence):
+            if not source_ids:
+                source_ids = evidence
+            evidence = []
+        existing_evidence_ids = {
+            item.get("source_id") for item in evidence if isinstance(item, dict)
+        }
+        evidence.extend(
+            {"source_id": str(source_id), "quote": ""}
+            for source_id in source_ids
+            if source_id not in existing_evidence_ids
+        )
+        normalized["evidence"] = evidence
+
+        counter_evidence = normalized.pop(
+            "contradicting_evidence", normalized.get("counter_evidence", [])
+        )
+        counter_source_ids = normalized.pop(
             "counter_source_ids", normalized.pop("contradicting_source_ids", [])
         )
-        normalized.setdefault(
-            "uncertainty", normalized.pop("uncertainty_reason", "")
+        if isinstance(counter_evidence, dict):
+            counter_evidence = [
+                {"source_id": source_id, "quote": quote}
+                for source_id, quote in counter_evidence.items()
+            ]
+        if not isinstance(counter_evidence, list):
+            counter_evidence = []
+        if counter_evidence and all(isinstance(item, str) for item in counter_evidence):
+            if not counter_source_ids:
+                counter_source_ids = counter_evidence
+            counter_evidence = []
+        existing_counter_ids = {
+            item.get("source_id") for item in counter_evidence if isinstance(item, dict)
+        }
+        counter_evidence.extend(
+            {"source_id": str(source_id), "quote": ""}
+            for source_id in counter_source_ids
+            if source_id not in existing_counter_ids
         )
-        evidence = normalized.pop("supporting_evidence", None)
-        if isinstance(evidence, list):
-            if not normalized["source_ids"]:
-                normalized["source_ids"] = [str(source_id) for source_id in evidence]
+        normalized["counter_evidence"] = counter_evidence
+        normalized.setdefault("uncertainty", normalized.pop("uncertainty_reason", ""))
+        normalized.setdefault("confidence", 0.5)
         return normalized
 
 
@@ -285,7 +424,9 @@ class ReportAudit(BaseModel):
                 subject = next((item.get(key) for key in keys if item.get(key)), "")
                 explanation = item.get("explanation", "")
                 rendered.append(
-                    f"{subject}: {explanation}" if subject and explanation else str(subject or explanation)
+                    f"{subject}: {explanation}"
+                    if subject and explanation
+                    else str(subject or explanation)
                 )
             return [item for item in rendered if item]
 
@@ -310,7 +451,7 @@ class ReportAudit(BaseModel):
         if raw.get("draft_answers_material_parts") is False:
             normalized["issues"] = [
                 *normalized["issues"],
-                "The draft does not answer every material part of the request."
+                "The draft does not answer every material part of the request.",
             ]
         if not normalized["passes"] and not normalized["revision_instructions"]:
             normalized["revision_instructions"] = [

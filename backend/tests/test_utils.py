@@ -4,6 +4,7 @@ from research_agent.utils import (
     deduplicate_sources_by_id,
     format_dimension_results,
     format_sources_for_research,
+    locate_evidence_quote,
     normalize_search_score,
     render_source_citations,
     tavily_results_to_sources,
@@ -39,6 +40,24 @@ def test_tavily_results_are_normalized_and_invalid_rows_are_skipped():
             "published_date": None,
         }
     ]
+
+
+def test_evidence_quote_is_recovered_from_original_source_with_locator():
+    content = "Header\nThe   authoritative value is 42 percent.\nFooter"
+
+    result = locate_evidence_quote(content, "the authoritative value is 42 percent.")
+
+    assert result == (
+        "The   authoritative value is 42 percent.",
+        "chars:7-47",
+    )
+
+
+def test_evidence_quote_rejects_missing_or_trivial_text():
+    assert (
+        locate_evidence_quote("A sufficiently long source body.", "not present") is None
+    )
+    assert locate_evidence_quote("A sufficiently long source body.", "source") is None
 
 
 def test_sources_are_deduplicated_by_url():
@@ -81,6 +100,41 @@ def test_deduplication_prefers_the_higher_quality_duplicate():
 
     assert len(result) == 1
     assert result[0]["source_id"] == "Sstrong"
+
+
+def test_deduplication_preserves_gap_requirements_across_queries():
+    first = {
+        "research_run_id": "run",
+        "source_id": "Sfirst",
+        "query": "official query",
+        "title": "A sufficiently distinctive primary source title",
+        "url": "https://example.com/report",
+        "content": "strong evidence",
+        "score": 0.9,
+        "gap_id": "gap-one",
+        "gap_ids": ["gap-one"],
+        "requested_source_types": ["government"],
+        "expected_evidence": "Official statistic",
+    }
+    duplicate = {
+        **first,
+        "source_id": "Ssecond",
+        "query": "independent query",
+        "score": 0.8,
+        "gap_id": "gap-two",
+        "gap_ids": ["gap-two"],
+        "requested_source_types": ["academic"],
+        "expected_evidence": "Independent comparison",
+    }
+
+    result = deduplicate_sources([first, duplicate])
+
+    assert len(result) == 1
+    assert result[0]["gap_ids"] == ["gap-one", "gap-two"]
+    assert result[0]["requested_source_types"] == ["academic", "government"]
+    assert result[0]["expected_evidence"] == (
+        "Official statistic | Independent comparison"
+    )
 
 
 def test_long_unicode_titles_are_deduplicated():
