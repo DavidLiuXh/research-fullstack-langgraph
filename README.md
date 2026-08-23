@@ -39,9 +39,11 @@ wrapping for long report content.
 
 The backend graph is defined in
 [`backend/src/research_agent/graph.py`](backend/src/research_agent/graph.py).
+The parent graph, gap-driven dimension subgraph, and report flow below reflect
+the current implementation.
 
 <p align="center">
-  <img src="./agent.png" title="Current research workflow" alt="Topic clarification and human-reviewed multidimensional research workflow" width="65%">
+  <img src="./agent-gap-workflow.png" title="Current gap-driven research workflow" alt="Topic clarification, human-reviewed multidimensional research, and gap-driven evidence convergence workflow" width="65%">
 </p>
 
 ### Parent graph
@@ -75,22 +77,37 @@ The backend graph is defined in
 
 ### Dimension subgraph
 
-Every dimension runs the same independent loop:
+Each dimension keeps an isolated evidence-gap registry and independently
+verifiable lifecycle:
 
-1. **Generate query.** Produce focused Tavily queries for the dimension and its
-   latest knowledge gap.
-2. **Web research.** Execute queries in parallel, normalize sources, assign
+1. **Plan initial gaps.** Decompose the approved dimension into concrete,
+   answerable evidence gaps with stable IDs, expected evidence, requested
+   source types, and priorities, then store them in the gap registry.
+2. **Select the next gap.** Choose one unresolved gap by priority and expected
+   impact so a small query budget is not spread thinly across many gaps.
+3. **Generate gap queries.** Produce focused Tavily queries for that gap, using
+   its expected evidence, requested source types, and failed-query history.
+4. **Web research.** Execute queries in parallel, normalize sources, assign
    stable source IDs, and retry transient Tavily failures.
-3. **Evaluate sources.** Deduplicate and score candidate evidence for relevance,
+5. **Evaluate sources.** Deduplicate and score candidate evidence for relevance,
    authority, recency, primary-source status, and domain diversity. Weak or
    redundant sources are rejected before reflection.
-4. **Reflection.** Evaluate whether the selected evidence is sufficient for that
-   dimension and identify concrete knowledge gaps.
-5. **Refine.** If evidence is insufficient and the loop budget remains, pass the
-   knowledge gap back to query generation.
-6. **Extract claims.** When research stops, convert selected evidence into a
-   concise auditable claim set before returning the dimension result to the
-   parent graph. The model uses a compact structured-output schema; source
+6. **Assess gap evidence.** Verify that newly accepted evidence directly answers
+   the active gap, contributes novel supported claims, satisfies the requested
+   source type, and is independent of existing evidence.
+7. **Update gap status.** Apply deterministic closure rules and record attempts,
+   evidence coverage, unresolved conflicts, and no-progress counts.
+8. **Route progress.** Continue focused queries while evidence is improving;
+   invoke search replanning after a stall; or move to the next gap after the
+   current gap is closed or explicitly classified as unresolvable.
+9. **Dimension reflection.** After all known gaps have been processed, audit the
+   complete dimension for omissions and contradictions. Newly discovered or
+   reopened gaps are merged into the gap registry before returning to gap
+   selection.
+10. **Extract claims.** Once the dimension is sufficient, or every remaining gap
+   has reached an explicit bounded terminal state, convert accepted evidence
+   into a concise auditable claim set before returning the dimension result to
+   the parent graph. The model uses a compact structured-output schema; source
    validation, evidence excerpts, and internal metadata are derived
    deterministically in code.
 
@@ -109,7 +126,7 @@ dimension completion in real time.
   acceptance of suggested assumptions.
 - Human-in-the-loop research-plan approval with iterative feedback.
 - Parallel research across independently isolated dimensions.
-- Reflection-driven follow-up queries within each dimension.
+- Gap-driven follow-up queries with deterministic closure and stall detection.
 - Quality-screened sources and per-dimension auditable claim extraction.
 - Independent report audit with a bounded revision loop.
 - Compact DeepSeek structured-output schemas with deterministic validation and

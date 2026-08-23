@@ -50,9 +50,13 @@ def test_single_search_query_string_is_normalized_for_bounded_evaluations():
 def test_deterministic_evaluator_scores_valid_evidence_and_trajectory():
     required_events = [
         "planning_dimensions",
+        "initial_gaps_planned",
+        "gap_selected",
         "queries_generated",
         "search_completed",
         "sources_evaluated",
+        "gap_evidence_assessed",
+        "gap_status_updated",
         "reflection_completed",
         "claims_extracted",
         "drafting_report",

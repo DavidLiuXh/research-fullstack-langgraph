@@ -80,6 +80,23 @@ interface ResearchCustomEvent {
   claim_count?: number;
   passes?: boolean;
   revision_count?: number;
+  gaps?: Array<{ gap_id?: string; question?: string }>;
+  gap?: {
+    gap_id?: string;
+    question?: string;
+    status?: string;
+    attempt_count?: number;
+  };
+  assessment?: {
+    gap_id?: string;
+    has_progress?: boolean;
+    new_matched_source_ids?: string[];
+  };
+  route?: string;
+  strategy_level?: number;
+  strategy?: string;
+  merged_gap_ids?: string[];
+  completion_status?: string;
 }
 
 const THREAD_STORAGE_KEY = "research-agent-thread-id";
@@ -219,10 +236,38 @@ export default function App() {
             data: event.approved ? "Research can begin." : event.feedback,
           };
           break;
+        case "initial_gaps_planned":
+          processedEvent = {
+            title: `Planning Evidence Gaps: ${event.dimension?.title || "Dimension"}`,
+            data:
+              event.gaps
+                ?.map((gap) => gap.question || gap.gap_id)
+                .filter(Boolean)
+                .join(", ") || "Initial evidence gaps planned.",
+          };
+          break;
+        case "gap_planning_fallback":
+          processedEvent = {
+            title: `Gap Planning Fallback: ${event.dimension?.title || "Dimension"}`,
+            data: "Structured gap planning was unavailable; the full dimension scope was retained as a conservative gap.",
+          };
+          break;
+        case "gap_selected":
+          processedEvent = {
+            title: `Researching Gap: ${event.dimension?.title || "Dimension"}`,
+            data: event.gap?.question || event.gap?.gap_id || "Evidence gap selected.",
+          };
+          break;
         case "queries_generated":
           processedEvent = {
             title: `Generating Queries: ${event.dimension?.title || "Dimension"}`,
             data: event.queries?.join(", ") || "",
+          };
+          break;
+        case "query_generation_fallback":
+          processedEvent = {
+            title: `Query Generation Fallback: ${event.dimension?.title || "Dimension"}`,
+            data: "Structured query generation was unavailable; a deterministic gap-specific query was used.",
           };
           break;
         case "search_started":
@@ -258,6 +303,46 @@ export default function App() {
             data: "Structured source scoring was unavailable; conservative fallback scoring was applied.",
           };
           break;
+        case "gap_evidence_assessed":
+          processedEvent = {
+            title: `Assessing Gap Evidence: ${event.dimension?.title || "Dimension"}`,
+            data: event.assessment?.has_progress
+              ? `${event.assessment.new_matched_source_ids?.length || 0} new direct sources matched`
+              : "No direct evidence gain in this pass.",
+          };
+          break;
+        case "gap_evidence_assessment_fallback":
+          processedEvent = {
+            title: `Gap Evidence Fallback: ${event.dimension?.title || "Dimension"}`,
+            data: "Structured evidence matching was unavailable; the gap remained open conservatively.",
+          };
+          break;
+        case "gap_status_updated":
+          processedEvent = {
+            title: `Gap Status: ${event.gap?.status || event.route || "updated"}`,
+            data: `${event.gap?.question || event.gap?.gap_id || "Evidence gap"} (attempt ${event.gap?.attempt_count || 0})`,
+          };
+          break;
+        case "search_replanned":
+          processedEvent = {
+            title: `Replanning Search: ${event.dimension?.title || "Dimension"}`,
+            data: `Strategy ${event.strategy_level || 0}: ${event.strategy || "Escalating the search strategy."}`,
+          };
+          break;
+        case "all_gaps_processed":
+          processedEvent = {
+            title: `Evidence Gaps Processed: ${event.dimension?.title || "Dimension"}`,
+            data: "Running a whole-dimension coverage audit.",
+          };
+          break;
+        case "gap_registry_merged":
+          processedEvent = {
+            title: `New Evidence Gaps: ${event.dimension?.title || "Dimension"}`,
+            data:
+              event.merged_gap_ids?.join(", ") ||
+              "No actionable gap was added.",
+          };
+          break;
         case "reflection_completed":
           processedEvent = {
             title: `Reflection: ${event.dimension?.title || "Dimension"}`,
@@ -275,7 +360,7 @@ export default function App() {
         case "dimension_completed":
           processedEvent = {
             title: "Dimension Research Complete",
-            data: `${event.dimension?.title || "Dimension"} (${event.loops} loops)`,
+            data: `${event.dimension?.title || "Dimension"} (${event.loops} gap searches, ${event.completion_status || "complete"})`,
           };
           break;
         case "claims_extracted":
@@ -362,10 +447,7 @@ export default function App() {
       setProcessedEventsTimeline([]);
       hasFinalizeEventOccurredRef.current = false;
 
-      // convert effort to, initial_search_query_count and max_research_loops
-      // low means max 1 loop and 1 query
-      // medium means max 3 loops and 3 queries
-      // high means max 10 loops and 5 queries
+      // Convert effort to queries per pass and focused attempts per evidence gap.
       let initial_search_query_count = 0;
       let max_research_loops = 0;
       switch (effort) {
@@ -375,11 +457,11 @@ export default function App() {
           break;
         case "medium":
           initial_search_query_count = 3;
-          max_research_loops = 3;
+          max_research_loops = 2;
           break;
         case "high":
           initial_search_query_count = 5;
-          max_research_loops = 10;
+          max_research_loops = 3;
           break;
       }
 

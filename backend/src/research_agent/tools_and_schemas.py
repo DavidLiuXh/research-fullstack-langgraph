@@ -205,6 +205,50 @@ class ResearchGap(BaseModel):
         return normalized
 
 
+class ResearchGapPlan(BaseModel):
+    """Initial evidence gaps planned for one approved research dimension."""
+
+    gaps: list[ResearchGap] = Field(min_length=1, max_length=6)
+
+    @model_validator(mode="after")
+    def normalize_planned_gaps(self):
+        """Remove duplicate stable IDs from provider output."""
+        unique: dict[str, ResearchGap] = {}
+        for gap in self.gaps:
+            unique.setdefault(gap.gap_id, gap)
+        self.gaps = list(unique.values())
+        return self
+
+
+class GapEvidenceAssessment(BaseModel):
+    """Semantic mapping between accepted sources and one active gap."""
+
+    gap_id: str
+    directly_answers_gap: bool = False
+    matched_source_ids: list[str] = Field(default_factory=list)
+    supported_claims: list[str] = Field(default_factory=list)
+    contradictory_source_ids: list[str] = Field(default_factory=list)
+    remaining_evidence: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_compact_assessment(cls, value):
+        """Accept conservative defaults for compact provider responses."""
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        normalized.setdefault("directly_answers_gap", normalized.pop("direct", False))
+        normalized.setdefault("matched_source_ids", normalized.pop("source_ids", []))
+        normalized.setdefault("supported_claims", normalized.pop("claims", []))
+        normalized.setdefault(
+            "contradictory_source_ids", normalized.pop("conflicting_source_ids", [])
+        )
+        normalized.setdefault(
+            "remaining_evidence", normalized.pop("missing_evidence", "")
+        )
+        return normalized
+
+
 class EvidenceConflict(BaseModel):
     description: str
     source_ids: list[str]
