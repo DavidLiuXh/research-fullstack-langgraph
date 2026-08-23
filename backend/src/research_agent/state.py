@@ -108,6 +108,9 @@ class OverallState(TypedDict):
     max_research_loops: int
     reasoning_model: str
     report_draft: str
+    report_generation_mode: str
+    report_overview: str
+    report_sections: list[dict]
     report_audit: dict
     report_revision_count: int
     max_report_revisions: int

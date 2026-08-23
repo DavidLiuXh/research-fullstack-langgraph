@@ -291,6 +291,108 @@ Audited dimension claims:
 """
 
 
+report_section_instructions = """Write one evidence-grounded section of a larger research report.
+
+Requirements:
+- Cover only the supplied research dimension and answer its material scope directly.
+- Use only the audited claims and evidence supplied below.
+- Attach exact source markers such as [S0-0-1] to factual statements.
+- Never invent facts, source IDs, URLs, or citations.
+- Preserve material uncertainty, contradictions, and unresolved gaps.
+- Do not add a report title or repeat the dimension heading; the application adds it.
+- Keep this section within 1,000 words or 1,800 Chinese characters.
+- Return only the section body and stop after its final paragraph.
+
+Main research topic:
+{research_topic}
+
+Dimension title:
+{dimension_title}
+
+Dimension scope:
+{dimension_scope}
+
+Audited claims for this dimension:
+{dimension_research}
+"""
+
+
+report_overview_instructions = """Write a compact executive overview for a sectioned research report.
+
+Requirements:
+- Answer the main research topic using only the supplied audited claims.
+- Synthesize the most decision-relevant conclusions across dimensions.
+- Attach only source markers that appear in the audited claims.
+- Do not invent facts, source IDs, URLs, or citations.
+- State material limitations when the evidence is incomplete.
+- Do not add a heading; the application adds it.
+- Keep the overview within 400 words or 700 Chinese characters.
+- Return only the overview and stop after its final paragraph.
+
+Main research topic:
+{research_topic}
+
+Compact audited claims:
+{dimension_research}
+"""
+
+
+report_section_revision_instructions = """Revise one section of a larger research report using the audit findings.
+
+Requirements:
+- Resolve only findings relevant to this dimension while preserving correct content.
+- Use only the supplied audited claims and evidence.
+- Preserve valid source markers and never invent facts, source IDs, URLs, or citations.
+- Remove or qualify unsupported statements and retain material limitations.
+- Do not add a report title or dimension heading; the application adds it.
+- Keep the section within 1,000 words or 1,800 Chinese characters.
+- Return the complete revised section body only.
+
+Main research topic:
+{research_topic}
+
+Dimension title:
+{dimension_title}
+
+Dimension scope:
+{dimension_scope}
+
+Audited claims for this dimension:
+{dimension_research}
+
+Current section:
+{current_section}
+
+Audit findings:
+{audit_findings}
+"""
+
+
+report_overview_revision_instructions = """Revise the executive overview of a sectioned research report.
+
+Requirements:
+- Resolve the audit findings relevant to overall coverage and conclusions.
+- Use only the supplied audited claims and preserve valid source markers.
+- Never invent facts, source IDs, URLs, or citations.
+- Keep material limitations explicit.
+- Do not add a heading; the application adds it.
+- Keep the overview within 400 words or 700 Chinese characters.
+- Return the complete revised overview only.
+
+Main research topic:
+{research_topic}
+
+Compact audited claims:
+{dimension_research}
+
+Current overview:
+{current_overview}
+
+Audit findings:
+{audit_findings}
+"""
+
+
 report_audit_instructions = """Audit a draft research report against its evidence before publication.
 
 Requirements:

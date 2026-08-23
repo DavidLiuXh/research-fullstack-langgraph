@@ -125,6 +125,11 @@ class ResearchEvaluationTarget:
             "research_dimensions": final_state.get("research_dimensions", []),
             "dimension_results": final_state.get("dimension_results", []),
             "sources": final_state.get("sources_gathered", []),
+            "report_generation_mode": final_state.get(
+                "report_generation_mode", "unknown"
+            ),
+            "report_overview": final_state.get("report_overview", ""),
+            "report_sections": final_state.get("report_sections", []),
             "report_audit": final_state.get("report_audit", {}),
             "report_revision_count": final_state.get("report_revision_count", 0),
             "max_report_revisions": final_state.get("max_report_revisions", 0),

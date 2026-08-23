@@ -188,6 +188,9 @@ def test_target_resumes_both_interrupts_and_collects_events(monkeypatch):
                 {
                     "messages": [{"content": "Final report"}],
                     "report_draft": "Draft",
+                    "report_generation_mode": "sectioned",
+                    "report_overview": "Overview",
+                    "report_sections": [{"dimension_id": "0"}],
                     "dimension_results": [],
                     "sources_gathered": [],
                 },
@@ -203,6 +206,9 @@ def test_target_resumes_both_interrupts_and_collects_events(monkeypatch):
         )
     )
     assert result["final_report"] == "Final report"
+    assert result["report_generation_mode"] == "sectioned"
+    assert result["report_overview"] == "Overview"
+    assert result["report_sections"] == [{"dimension_id": "0"}]
     assert result["node_trajectory"] == ["finalize_answer"]
     assert result["custom_events"] == [{"type": "finalizing_answer"}]
 

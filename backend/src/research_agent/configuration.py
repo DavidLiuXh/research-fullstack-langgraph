@@ -49,6 +49,20 @@ class Configuration(BaseModel):
         description="Maximum report revisions after independent quality audits.",
     )
 
+    report_sectioning_claim_threshold: int = Field(
+        default=18,
+        ge=4,
+        le=100,
+        description="Use sectioned drafting when the audited claim count reaches this value.",
+    )
+
+    report_sectioning_material_chars: int = Field(
+        default=18000,
+        ge=4000,
+        le=100000,
+        description="Use sectioned drafting when compact evidence exceeds this size.",
+    )
+
     tavily_search_depth: str = Field(
         default="advanced",
         description="Tavily search depth: basic or advanced.",
