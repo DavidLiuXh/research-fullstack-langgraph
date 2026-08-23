@@ -85,6 +85,9 @@ class DimensionResult(TypedDict):
     high_priority_gap_source_coverage_count: int
     evidence_gain_history: list[dict]
     search_failure_count: int
+    closed_gap_count: int
+    unresolvable_gap_count: int
+    gap_status_counts: dict[str, int]
 
 
 class OverallState(TypedDict):
@@ -141,6 +144,13 @@ class DimensionState(TypedDict):
     evidence_source_id_history: Annotated[list[list[str]], operator.add]
     evidence_gain_history: Annotated[list[dict], operator.add]
     gap_registry: dict[str, dict]
+    active_gap_id: str
+    active_gap: dict
+    gap_processing_complete: bool
+    gap_evidence_assessment: dict
+    pending_reflection_gaps: list[dict]
+    gap_route: str
+    dimension_reflection_count: int
     resolved_gap_ids: list[str]
     gap_source_coverage_ids: list[str]
     completion_status: str
@@ -164,6 +174,7 @@ class QueryGenerationState(TypedDict):
     search_tasks: list[dict]
     research_loop_count: int
     query_history: Annotated[list[str], operator.add]
+    active_gap_id: str
 
 
 class WebSearchState(TypedDict):

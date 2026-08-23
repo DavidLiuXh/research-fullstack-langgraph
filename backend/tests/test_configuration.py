@@ -32,6 +32,10 @@ def test_quality_defaults_allow_adaptive_research():
     configuration = Configuration()
 
     assert configuration.max_research_loops == 3
+    assert configuration.max_initial_gaps_per_dimension == 4
+    assert configuration.max_gap_no_progress_attempts == 2
+    assert configuration.min_independent_sources_per_high_gap == 2
+    assert configuration.max_dimension_reflections == 3
     assert configuration.min_accepted_sources_per_dimension == 2
     assert configuration.min_authoritative_sources_per_dimension == 1
     assert configuration.min_primary_sources_per_dimension == 1

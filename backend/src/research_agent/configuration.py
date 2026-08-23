@@ -39,7 +39,35 @@ class Configuration(BaseModel):
         default=3,
         ge=1,
         le=8,
-        description="Maximum research loops performed independently per dimension.",
+        description="Maximum focused search attempts allowed for each evidence gap.",
+    )
+
+    max_initial_gaps_per_dimension: int = Field(
+        default=4,
+        ge=1,
+        le=6,
+        description="Maximum evidence gaps planned before researching a dimension.",
+    )
+
+    max_gap_no_progress_attempts: int = Field(
+        default=2,
+        ge=1,
+        le=4,
+        description="Consecutive no-progress attempts before a gap is unresolvable.",
+    )
+
+    min_independent_sources_per_high_gap: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description="Independent accepted sources required to close a high-priority gap.",
+    )
+
+    max_dimension_reflections: int = Field(
+        default=3,
+        ge=1,
+        le=6,
+        description="Maximum whole-dimension audits that may discover or reopen gaps.",
     )
 
     max_report_revisions: int = Field(
