@@ -115,6 +115,7 @@ async def evaluate_example(
                 for result in outputs.get("dimension_results", [])
             ),
             "revisions": outputs.get("report_revision_count", 0),
+            "report_generation_mode": outputs.get("report_generation_mode", "unknown"),
             "completion_statuses": [
                 result.get("completion_status", "unknown")
                 for result in outputs.get("dimension_results", [])

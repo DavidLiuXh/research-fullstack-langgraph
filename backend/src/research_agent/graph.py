@@ -38,7 +38,11 @@ from research_agent.prompts import (
     query_writer_instructions,
     reflection_instructions,
     report_audit_instructions,
+    report_overview_instructions,
+    report_overview_revision_instructions,
     report_revision_instructions,
+    report_section_instructions,
+    report_section_revision_instructions,
     source_evaluation_instructions,
     topic_clarification_instructions,
 )
@@ -1390,24 +1394,246 @@ def _audited_claim_source_ids(results: list[DimensionResult]) -> set[str]:
     }
 
 
-def _partial_length_limited_content(error: LengthFinishReasonError) -> str:
-    """Recover usable text returned before a provider output limit was reached."""
-    completion = getattr(error, "completion", None)
-    choices = getattr(completion, "choices", ())
-    if choices:
-        message = getattr(choices[0], "message", None)
-        content = getattr(message, "content", None)
-        if isinstance(content, str) and content.strip():
-            return content.strip()
-    raise error
+def _report_requires_sectioning(
+    results: list[DimensionResult], material: str, configurable: Configuration
+) -> bool:
+    """Choose sectioned drafting before a single response is likely to overflow."""
+    claim_count = sum(len(result.get("claims", [])) for result in results)
+    return (
+        claim_count >= configurable.report_sectioning_claim_threshold
+        or len(material) >= configurable.report_sectioning_material_chars
+    )
+
+
+def _uses_chinese(text: str) -> bool:
+    """Return whether user-facing report scaffolding should use Chinese."""
+    return bool(re.search(r"[\u3400-\u9fff]", text))
+
+
+def _deterministic_report_section(result: DimensionResult, research_topic: str) -> str:
+    """Build a bounded, citation-safe section when model generation cannot finish."""
+    chinese = _uses_chinese(research_topic)
+    claims = result.get("claims", [])
+    if claims:
+        findings = "\n".join(
+            "- "
+            + claim["claim"]
+            + " "
+            + " ".join(f"[{source_id}]" for source_id in claim["supporting_source_ids"])
+            + (
+                f" Uncertainty: {claim['uncertainty_reason']}"
+                if claim.get("uncertainty_reason")
+                else ""
+            )
+            for claim in claims
+        )
+    else:
+        findings = (
+            "该维度没有通过证据审计的结论。"
+            if chinese
+            else "No claim passed the evidence audit for this dimension."
+        )
+    limitations = []
+    if result.get("completion_status") != "sufficient":
+        limitations.append(
+            ("调研状态：" if chinese else "Research status: ")
+            + f"{result.get('completion_status', 'incomplete')}."
+        )
+    limitations.extend(
+        str(gap.get("question") or gap.get("reason") or gap)
+        for gap in result.get("unresolved_gaps", [])[:3]
+    )
+    limitation_text = (
+        ("\n\n局限性：\n" if chinese else "\n\nLimitations:\n")
+        + "\n".join(f"- {item}" for item in limitations)
+        if limitations
+        else ""
+    )
+    return findings + limitation_text
+
+
+def _deterministic_report_overview(
+    results: list[DimensionResult], research_topic: str
+) -> str:
+    """Describe section coverage without adding unsupported factual content."""
+    completed = sum(result.get("is_sufficient", False) for result in results)
+    if _uses_chinese(research_topic):
+        return (
+            f"本报告基于经过审计的结论—证据记录，综合了 {len(results)} 个调研维度。"
+            f"其中 {completed} 个维度达到配置的完成标准；其余证据限制在对应章节中披露。"
+        )
+    return (
+        f"This report synthesizes {len(results)} research dimensions from audited "
+        f"claim–evidence records. {completed} dimension(s) met the configured "
+        "completion criteria; remaining limitations are disclosed in their sections."
+    )
+
+
+def _generate_report_section(
+    result: DimensionResult,
+    research_topic: str,
+    model: str,
+    research_run_id: str,
+) -> str:
+    """Generate one bounded section with compact retry and deterministic fallback."""
+    dimension = result["dimension"]
+    material = format_dimension_results(
+        [result],
+        max_claims_per_dimension=max(1, len(result.get("claims", []))),
+        max_evidence_chars=220,
+    )
+
+    def prompt_for(section_material: str) -> str:
+        return report_section_instructions.format(
+            research_topic=research_topic,
+            dimension_title=dimension["title"],
+            dimension_scope=dimension["scope"],
+            dimension_research=section_material,
+        )
+
+    emit_research_event(
+        "report_section_started",
+        research_run_id=research_run_id,
+        dimension=dimension,
+    )
+    try:
+        response = create_deepseek_model(model).invoke(prompt_for(material))
+        content = str(response.content).strip()
+    except LengthFinishReasonError:
+        emit_research_event(
+            "report_section_retry",
+            research_run_id=research_run_id,
+            dimension=dimension,
+            reason="length_limit",
+        )
+        compact_material = format_dimension_results(
+            [result], max_claims_per_dimension=4, max_evidence_chars=120
+        )
+        retry_prompt = prompt_for(compact_material) + (
+            "\nThe previous section exceeded the output limit. Return a concise "
+            "section under 600 words or 1,000 Chinese characters. Do not repeat "
+            "evidence and stop after the final paragraph."
+        )
+        try:
+            response = create_deepseek_model(model).invoke(retry_prompt)
+            content = str(response.content).strip()
+        except LengthFinishReasonError:
+            content = _deterministic_report_section(result, research_topic)
+            emit_research_event(
+                "report_section_fallback",
+                research_run_id=research_run_id,
+                dimension=dimension,
+                reason="length_limit",
+            )
+    if not content:
+        content = _deterministic_report_section(result, research_topic)
+        emit_research_event(
+            "report_section_fallback",
+            research_run_id=research_run_id,
+            dimension=dimension,
+            reason="empty_response",
+        )
+    emit_research_event(
+        "report_section_completed",
+        research_run_id=research_run_id,
+        dimension=dimension,
+        character_count=len(content),
+    )
+    return content
+
+
+def _generate_sectioned_report(
+    results: list[DimensionResult],
+    research_topic: str,
+    model: str,
+    research_run_id: str,
+) -> tuple[str, str, list[dict]]:
+    """Generate bounded semantic sections and merge them without an LLM call."""
+    emit_research_event(
+        "report_sectioning_started",
+        research_run_id=research_run_id,
+        dimension_count=len(results),
+    )
+    sections = [
+        {
+            "dimension_id": result["dimension"]["id"],
+            "title": result["dimension"]["title"],
+            "content": _generate_report_section(
+                result, research_topic, model, research_run_id
+            ),
+        }
+        for result in results
+    ]
+    overview_material = format_dimension_results(
+        results, max_claims_per_dimension=3, max_evidence_chars=100
+    )
+    overview_prompt = report_overview_instructions.format(
+        research_topic=research_topic,
+        dimension_research=overview_material,
+    )
+    try:
+        overview = str(
+            create_deepseek_model(model).invoke(overview_prompt).content
+        ).strip()
+    except LengthFinishReasonError:
+        overview = _deterministic_report_overview(results, research_topic)
+        emit_research_event(
+            "report_overview_fallback",
+            research_run_id=research_run_id,
+            reason="length_limit",
+        )
+    if not overview:
+        overview = _deterministic_report_overview(results, research_topic)
+        emit_research_event(
+            "report_overview_fallback",
+            research_run_id=research_run_id,
+            reason="empty_response",
+        )
+    report = _assemble_sectioned_report(research_topic, overview, sections)
+    emit_research_event(
+        "report_draft_sectioned",
+        research_run_id=research_run_id,
+        section_count=len(sections),
+        character_count=len(report),
+    )
+    return report, overview, sections
+
+
+def _assemble_sectioned_report(
+    research_topic: str, overview: str, sections: list[dict]
+) -> str:
+    """Merge independently generated report parts without another model call."""
+    if _uses_chinese(research_topic):
+        report_parts = ["# 调研报告", "## 执行摘要\n\n" + overview]
+    else:
+        report_parts = ["# Research Report", "## Executive Summary\n\n" + overview]
+    report_parts.extend(
+        f"## {section['title']}\n\n{section['content']}" for section in sections
+    )
+    return "\n\n".join(report_parts)
 
 
 def draft_report(state: OverallState, config: RunnableConfig):
     """Draft the report from audited dimension claims."""
     configurable = Configuration.from_runnable_config(config)
     model = state.get("reasoning_model") or configurable.answer_model
-    _, _, material = _current_research_material(state)
+    current_results, _, material = _current_research_material(state)
     emit_research_event("drafting_report", research_run_id=state["research_run_id"])
+    if _report_requires_sectioning(current_results, material, configurable):
+        report_draft, overview, sections = _generate_sectioned_report(
+            current_results,
+            state["normalized_research_topic"],
+            model,
+            state["research_run_id"],
+        )
+        return {
+            "report_draft": report_draft,
+            "report_generation_mode": "sectioned",
+            "report_overview": overview,
+            "report_sections": sections,
+            "report_revision_count": 0,
+            "max_report_revisions": configurable.max_report_revisions,
+        }
     prompt = answer_instructions.format(
         current_date=get_current_date(),
         research_topic=state["normalized_research_topic"],
@@ -1416,42 +1642,51 @@ def draft_report(state: OverallState, config: RunnableConfig):
     try:
         result = create_deepseek_model(model).invoke(prompt)
     except LengthFinishReasonError:
-        current_results, _, _ = _current_research_material(state)
-        compact_material = format_dimension_results(
-            current_results, max_claims_per_dimension=5, max_evidence_chars=120
-        )
         emit_research_event(
-            "report_draft_retry",
+            "report_draft_switching_to_sections",
             research_run_id=state["research_run_id"],
             reason="length_limit",
         )
-        compact_prompt = (
-            answer_instructions.format(
-                current_date=get_current_date(),
-                research_topic=state["normalized_research_topic"],
-                dimension_research=compact_material,
-            )
-            + "\nThe first draft exceeded the output limit. Write a concise executive "
-            "report under 800 words or 1,600 Chinese characters. Use short sections, "
-            "do not repeat evidence, and stop immediately after the conclusion."
+        report_draft, overview, sections = _generate_sectioned_report(
+            current_results,
+            state["normalized_research_topic"],
+            model,
+            state["research_run_id"],
         )
-        try:
-            result = create_deepseek_model(model).invoke(compact_prompt)
-            report_draft = str(result.content)
-        except LengthFinishReasonError as retry_error:
-            report_draft = _partial_length_limited_content(retry_error)
-            emit_research_event(
-                "report_draft_partial_recovered",
-                research_run_id=state["research_run_id"],
-                reason="length_limit",
-            )
         return {
             "report_draft": report_draft,
+            "report_generation_mode": "sectioned",
+            "report_overview": overview,
+            "report_sections": sections,
+            "report_revision_count": 0,
+            "max_report_revisions": configurable.max_report_revisions,
+        }
+    report_draft = str(result.content).strip()
+    if not report_draft:
+        emit_research_event(
+            "report_draft_switching_to_sections",
+            research_run_id=state["research_run_id"],
+            reason="empty_response",
+        )
+        report_draft, overview, sections = _generate_sectioned_report(
+            current_results,
+            state["normalized_research_topic"],
+            model,
+            state["research_run_id"],
+        )
+        return {
+            "report_draft": report_draft,
+            "report_generation_mode": "sectioned",
+            "report_overview": overview,
+            "report_sections": sections,
             "report_revision_count": 0,
             "max_report_revisions": configurable.max_report_revisions,
         }
     return {
-        "report_draft": str(result.content),
+        "report_draft": report_draft,
+        "report_generation_mode": "single_pass",
+        "report_overview": "",
+        "report_sections": [],
         "report_revision_count": 0,
         "max_report_revisions": configurable.max_report_revisions,
     }
@@ -1467,12 +1702,33 @@ def audit_report(state: OverallState, config: RunnableConfig):
         draft_report=state["report_draft"],
         output_schema=json.dumps(ReportAudit.model_json_schema(), ensure_ascii=False),
     )
-    result = (
-        create_deepseek_model(configurable.reflection_model)
-        .with_structured_output(ReportAudit, method="json_mode")
-        .invoke(prompt)
-    )
-    audit = result.model_dump()
+    try:
+        result = (
+            create_deepseek_model(configurable.reflection_model)
+            .with_structured_output(ReportAudit, method="json_mode")
+            .invoke(prompt)
+        )
+        audit = result.model_dump()
+    except (LengthFinishReasonError, OutputParserException) as error:
+        reason = (
+            "length_limit"
+            if isinstance(error, LengthFinishReasonError)
+            else "structured_output_failure"
+        )
+        audit = ReportAudit(
+            passes=False,
+            issues=[
+                "The independent model audit could not complete; deterministic citation checks were still applied."
+            ],
+            revision_instructions=[
+                "Preserve only audited claims, valid source markers, and explicit evidence limitations."
+            ],
+        ).model_dump()
+        emit_research_event(
+            "report_audit_fallback",
+            research_run_id=state["research_run_id"],
+            reason=reason,
+        )
     current_results, sources, _ = _current_research_material(state)
     valid_ids = {source["source_id"] for source in sources}
     claim_ids = _audited_claim_source_ids(current_results)
@@ -1517,11 +1773,134 @@ def route_report_audit(state: OverallState):
     return "revise_report"
 
 
+def _bounded_report_part_revision(
+    *,
+    prompt: str,
+    fallback: str,
+    model: str,
+    research_run_id: str,
+    event_prefix: str,
+    event_data: dict | None = None,
+) -> str:
+    """Revise one bounded report part without risking the entire report."""
+    event_data = event_data or {}
+    try:
+        content = str(create_deepseek_model(model).invoke(prompt).content).strip()
+    except LengthFinishReasonError:
+        emit_research_event(
+            f"{event_prefix}_retry",
+            research_run_id=research_run_id,
+            reason="length_limit",
+            **event_data,
+        )
+        retry_prompt = prompt + (
+            "\nThe previous revision exceeded the output limit. Preserve the essential "
+            "supported findings, remove repetition, and return only the complete "
+            "revised part in at most half the requested length."
+        )
+        try:
+            content = str(
+                create_deepseek_model(model).invoke(retry_prompt).content
+            ).strip()
+        except LengthFinishReasonError:
+            content = ""
+    if content:
+        return content
+    emit_research_event(
+        f"{event_prefix}_skipped",
+        research_run_id=research_run_id,
+        reason="length_limit_or_empty_response",
+        **event_data,
+    )
+    return fallback
+
+
+def _revise_sectioned_report(
+    state: OverallState, current_results: list[DimensionResult], model: str
+) -> dict:
+    """Revise a long report by bounded parts and merge it deterministically."""
+    research_topic = state["normalized_research_topic"]
+    research_run_id = state["research_run_id"]
+    audit_findings = json.dumps(state["report_audit"], ensure_ascii=False)
+    results_by_id = {result["dimension"]["id"]: result for result in current_results}
+    revised_sections = []
+    for section in state.get("report_sections", []):
+        result = results_by_id.get(str(section.get("dimension_id", "")))
+        if result is None:
+            revised_sections.append(section)
+            continue
+        dimension = result["dimension"]
+        material = format_dimension_results(
+            [result],
+            max_claims_per_dimension=max(1, len(result.get("claims", []))),
+            max_evidence_chars=160,
+        )
+        prompt = report_section_revision_instructions.format(
+            research_topic=research_topic,
+            dimension_title=dimension["title"],
+            dimension_scope=dimension["scope"],
+            dimension_research=material,
+            current_section=section.get("content", ""),
+            audit_findings=audit_findings,
+        )
+        revised_sections.append(
+            {
+                **section,
+                "content": _bounded_report_part_revision(
+                    prompt=prompt,
+                    fallback=str(section.get("content", "")),
+                    model=model,
+                    research_run_id=research_run_id,
+                    event_prefix="report_section_revision",
+                    event_data={"dimension": dimension},
+                ),
+            }
+        )
+    overview_material = format_dimension_results(
+        current_results, max_claims_per_dimension=3, max_evidence_chars=100
+    )
+    current_overview = state.get("report_overview", "")
+    overview_prompt = report_overview_revision_instructions.format(
+        research_topic=research_topic,
+        dimension_research=overview_material,
+        current_overview=current_overview,
+        audit_findings=audit_findings,
+    )
+    revised_overview = _bounded_report_part_revision(
+        prompt=overview_prompt,
+        fallback=current_overview
+        or _deterministic_report_overview(current_results, research_topic),
+        model=model,
+        research_run_id=research_run_id,
+        event_prefix="report_overview_revision",
+    )
+    revised_report = _assemble_sectioned_report(
+        research_topic, revised_overview, revised_sections
+    )
+    emit_research_event(
+        "report_sections_revised",
+        research_run_id=research_run_id,
+        section_count=len(revised_sections),
+        character_count=len(revised_report),
+    )
+    return {
+        "report_draft": revised_report,
+        "report_overview": revised_overview,
+        "report_sections": revised_sections,
+        "report_generation_mode": "sectioned",
+        "report_revision_count": state.get("report_revision_count", 0) + 1,
+    }
+
+
 def revise_report(state: OverallState, config: RunnableConfig):
     """Revise only the issues identified by the independent audit."""
     configurable = Configuration.from_runnable_config(config)
     model = state.get("reasoning_model") or configurable.answer_model
     current_results, _, _ = _current_research_material(state)
+    if state.get("report_generation_mode") == "sectioned" and state.get(
+        "report_sections"
+    ):
+        return _revise_sectioned_report(state, current_results, model)
     material = format_dimension_results(
         current_results, max_claims_per_dimension=5, max_evidence_chars=120
     )

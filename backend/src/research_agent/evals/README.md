@@ -13,6 +13,7 @@ The first-phase suite combines deterministic checks with DeepSeek-as-judge:
 - primary and authoritative source coverage and source-quality metadata
 - domain diversity and workflow trajectory completeness
 - clarification routing and report revision budget compliance
+- single-pass versus sectioned report generation mode
 - relevance, structure, completeness, source quality, analytical rigor, balance
 
 Run a bounded local smoke evaluation from `backend/`:

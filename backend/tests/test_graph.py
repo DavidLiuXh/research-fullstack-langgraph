@@ -9,6 +9,7 @@ from research_agent.graph import (
     analyze_research_topic,
     audit_report,
     dispatch_research_dimensions,
+    draft_report,
     evaluate_sources,
     extract_claims,
     finalize_answer,
@@ -60,6 +61,70 @@ def _dimension_state(**overrides):
     }
     state.update(overrides)
     return state
+
+
+def _report_state(*, dimensions=2, claims_per_dimension=1, topic="Research topic"):
+    dimension_results = []
+    sources = []
+    for dimension_index in range(dimensions):
+        claims = []
+        dimension_sources = []
+        for claim_index in range(claims_per_dimension):
+            source_id = f"S{dimension_index}-{claim_index}"
+            source = {
+                "research_run_id": "run",
+                "source_id": source_id,
+                "query": "query",
+                "title": f"Source {source_id}",
+                "url": f"https://example.com/{source_id}",
+                "content": f"Verified evidence for claim {claim_index}.",
+            }
+            sources.append(source)
+            dimension_sources.append(source)
+            claims.append(
+                {
+                    "claim": f"Verified claim {dimension_index}-{claim_index}.",
+                    "supporting_source_ids": [source_id],
+                    "supporting_evidence": [
+                        {
+                            "source_id": source_id,
+                            "quote": source["content"],
+                            "locator": "chars:0-30",
+                        }
+                    ],
+                    "contradicting_source_ids": [],
+                    "contradicting_evidence": [],
+                    "confidence": 0.9,
+                    "uncertainty_reason": "",
+                }
+            )
+        dimension_results.append(
+            {
+                "research_run_id": "run",
+                "dimension": {
+                    "id": str(dimension_index),
+                    "title": f"Dimension {dimension_index}",
+                    "scope": f"Scope {dimension_index}",
+                },
+                "research_content": "summary",
+                "sources": dimension_sources,
+                "research_loop_count": 1,
+                "is_sufficient": True,
+                "completion_status": "sufficient",
+                "covered_questions": [],
+                "unresolved_gaps": [],
+                "contradictions": [],
+                "source_quality_issues": [],
+                "confidence": 0.9,
+                "claims": claims,
+            }
+        )
+    return {
+        "normalized_research_topic": topic,
+        "research_run_id": "run",
+        "dimension_results": dimension_results,
+        "sources_gathered": sources,
+    }
 
 
 def test_dimension_gap_routes_back_to_query_generation():
@@ -915,6 +980,230 @@ def test_report_audit_route_is_bounded():
     )
 
 
+def test_small_report_uses_single_pass_drafting(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class ShortReportModel:
+        def invoke(self, prompt):
+            return AIMessage(content="A concise report [S0-0].")
+
+    monkeypatch.setattr(
+        graph_module, "create_deepseek_model", lambda *a, **k: ShortReportModel()
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+
+    result = draft_report(
+        _report_state(dimensions=1),
+        {
+            "configurable": {
+                "report_sectioning_claim_threshold": 100,
+                "report_sectioning_material_chars": 100000,
+            }
+        },
+    )
+
+    assert result["report_generation_mode"] == "single_pass"
+    assert result["report_sections"] == []
+    assert result["report_draft"] == "A concise report [S0-0]."
+
+
+def test_large_report_is_generated_and_merged_by_dimension(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class SectionModel:
+        prompts = []
+
+        def invoke(self, prompt):
+            self.prompts.append(prompt)
+            if "executive overview" in prompt:
+                return AIMessage(content="Cross-dimension overview.")
+            dimension = "0" if "Dimension 0" in prompt else "1"
+            return AIMessage(content=f"Section {dimension} " + ("x" * 5000))
+
+    model = SectionModel()
+    monkeypatch.setattr(graph_module, "create_deepseek_model", lambda *a, **k: model)
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+
+    result = draft_report(
+        _report_state(dimensions=2, claims_per_dimension=2),
+        {"configurable": {"report_sectioning_claim_threshold": 4}},
+    )
+
+    assert result["report_generation_mode"] == "sectioned"
+    assert len(result["report_sections"]) == 2
+    assert len(result["report_draft"]) > 10000
+    assert "Section 0" in result["report_draft"]
+    assert "Section 1" in result["report_draft"]
+    assert len(model.prompts) == 3
+
+
+def test_sectioned_generation_keeps_all_dimension_claims(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class CapturingModel:
+        prompts = []
+
+        def invoke(self, prompt):
+            self.prompts.append(prompt)
+            return AIMessage(content="Bounded report part.")
+
+    model = CapturingModel()
+    monkeypatch.setattr(graph_module, "create_deepseek_model", lambda *a, **k: model)
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+
+    draft_report(
+        _report_state(dimensions=1, claims_per_dimension=10),
+        {"configurable": {"report_sectioning_claim_threshold": 4}},
+    )
+
+    assert "Verified claim 0-0." in model.prompts[0]
+    assert "Verified claim 0-9." in model.prompts[0]
+
+
+def test_length_limited_draft_switches_to_citation_safe_section_fallback(
+    monkeypatch,
+):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class FakeLengthError(Exception):
+        pass
+
+    class LengthLimitedModel:
+        def invoke(self, prompt):
+            raise FakeLengthError("limit")
+
+    events = []
+    monkeypatch.setattr(graph_module, "LengthFinishReasonError", FakeLengthError)
+    monkeypatch.setattr(
+        graph_module, "create_deepseek_model", lambda *a, **k: LengthLimitedModel()
+    )
+    monkeypatch.setattr(
+        graph_module,
+        "emit_research_event",
+        lambda event_type, **data: events.append({"type": event_type, **data}),
+    )
+
+    result = draft_report(
+        _report_state(dimensions=1, topic="中文调研主题"),
+        {
+            "configurable": {
+                "report_sectioning_claim_threshold": 100,
+                "report_sectioning_material_chars": 100000,
+            }
+        },
+    )
+
+    assert result["report_generation_mode"] == "sectioned"
+    assert result["report_draft"].startswith("# 调研报告")
+    assert "Verified claim 0-0. [S0-0]" in result["report_draft"]
+    assert [event["type"] for event in events] == [
+        "drafting_report",
+        "report_draft_switching_to_sections",
+        "report_sectioning_started",
+        "report_section_started",
+        "report_section_retry",
+        "report_section_fallback",
+        "report_section_completed",
+        "report_overview_fallback",
+        "report_draft_sectioned",
+    ]
+
+
+def test_sectioned_report_revision_preserves_long_report(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class SectionRevisionModel:
+        def invoke(self, prompt):
+            if "executive overview" in prompt:
+                return AIMessage(content="Revised overview.")
+            dimension = "0" if "Dimension 0" in prompt else "1"
+            return AIMessage(content=f"Revised section {dimension} " + ("x" * 5000))
+
+    monkeypatch.setattr(
+        graph_module, "create_deepseek_model", lambda *a, **k: SectionRevisionModel()
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    state = {
+        **_report_state(dimensions=2, claims_per_dimension=2),
+        "report_generation_mode": "sectioned",
+        "report_overview": "Original overview.",
+        "report_sections": [
+            {"dimension_id": "0", "title": "Dimension 0", "content": "Old 0"},
+            {"dimension_id": "1", "title": "Dimension 1", "content": "Old 1"},
+        ],
+        "report_draft": "Old complete report.",
+        "report_audit": {
+            "passes": False,
+            "issues": ["Improve clarity."],
+            "revision_instructions": ["Revise relevant sections."],
+        },
+        "report_revision_count": 0,
+    }
+
+    result = revise_report(state, {})
+
+    assert result["report_generation_mode"] == "sectioned"
+    assert result["report_overview"] == "Revised overview."
+    assert len(result["report_draft"]) > 10000
+    assert "Revised section 0" in result["report_draft"]
+    assert "Revised section 1" in result["report_draft"]
+    assert result["report_revision_count"] == 1
+
+
+def test_length_limited_section_revisions_keep_existing_parts(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class FakeLengthError(Exception):
+        pass
+
+    class LengthLimitedModel:
+        def invoke(self, prompt):
+            raise FakeLengthError("limit")
+
+    events = []
+    monkeypatch.setattr(graph_module, "LengthFinishReasonError", FakeLengthError)
+    monkeypatch.setattr(
+        graph_module, "create_deepseek_model", lambda *a, **k: LengthLimitedModel()
+    )
+    monkeypatch.setattr(
+        graph_module,
+        "emit_research_event",
+        lambda event_type, **data: events.append({"type": event_type, **data}),
+    )
+    state = {
+        **_report_state(dimensions=1),
+        "report_generation_mode": "sectioned",
+        "report_overview": "Existing overview.",
+        "report_sections": [
+            {
+                "dimension_id": "0",
+                "title": "Dimension 0",
+                "content": "Existing section [S0-0].",
+            }
+        ],
+        "report_draft": "Existing report.",
+        "report_audit": {
+            "passes": False,
+            "issues": ["Improve clarity."],
+            "revision_instructions": ["Revise relevant sections."],
+        },
+        "report_revision_count": 0,
+    }
+
+    result = revise_report(state, {})
+
+    assert "Existing overview." in result["report_draft"]
+    assert "Existing section [S0-0]." in result["report_draft"]
+    assert result["report_revision_count"] == 1
+    assert [event["type"] for event in events] == [
+        "report_section_revision_retry",
+        "report_section_revision_skipped",
+        "report_overview_revision_retry",
+        "report_overview_revision_skipped",
+        "report_sections_revised",
+    ]
+
+
 def test_report_revision_keeps_draft_when_both_attempts_hit_length_limit(monkeypatch):
     graph_module = importlib.import_module("research_agent.graph")
 
@@ -1002,6 +1291,48 @@ def test_report_audit_rejects_unknown_source_markers(monkeypatch):
 
     assert result["report_audit"]["passes"] is False
     assert "Sinvented" in result["report_audit"]["issues"][0]
+
+
+def test_report_audit_length_limit_uses_conservative_fallback(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class FakeLengthError(Exception):
+        pass
+
+    class LengthLimitedAuditModel:
+        def with_structured_output(self, schema, method):
+            assert schema is ReportAudit
+            return self
+
+        def invoke(self, prompt):
+            raise FakeLengthError("limit")
+
+    events = []
+    monkeypatch.setattr(graph_module, "LengthFinishReasonError", FakeLengthError)
+    monkeypatch.setattr(
+        graph_module,
+        "create_deepseek_model",
+        lambda *a, **k: LengthLimitedAuditModel(),
+    )
+    monkeypatch.setattr(
+        graph_module,
+        "emit_research_event",
+        lambda event_type, **data: events.append({"type": event_type, **data}),
+    )
+    state = {
+        **_report_state(dimensions=1),
+        "report_draft": "Verified claim [S0-0].",
+        "report_revision_count": 1,
+    }
+
+    result = audit_report(state, {})
+
+    assert result["report_audit"]["passes"] is False
+    assert "could not complete" in result["report_audit"]["issues"][0]
+    assert [event["type"] for event in events] == [
+        "report_audit_fallback",
+        "report_audit_completed",
+    ]
 
 
 def test_report_audit_schema_recovers_wrapped_alternative_fields():

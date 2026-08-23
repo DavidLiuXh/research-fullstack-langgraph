@@ -35,3 +35,5 @@ def test_quality_defaults_allow_adaptive_research():
     assert configuration.min_accepted_sources_per_dimension == 2
     assert configuration.min_authoritative_sources_per_dimension == 1
     assert configuration.min_primary_sources_per_dimension == 1
+    assert configuration.report_sectioning_claim_threshold == 18
+    assert configuration.report_sectioning_material_chars == 18000
