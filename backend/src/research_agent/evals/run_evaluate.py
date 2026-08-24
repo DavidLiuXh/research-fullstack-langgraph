@@ -112,7 +112,10 @@ async def evaluate_example(
             "sources": len(outputs.get("sources", [])),
             "claims": sum(
                 len(result.get("claims", []))
-                for result in outputs.get("dimension_results", [])
+                for result in (
+                    outputs.get("report_dimension_results")
+                    or outputs.get("dimension_results", [])
+                )
             ),
             "revisions": outputs.get("report_revision_count", 0),
             "report_generation_mode": outputs.get("report_generation_mode", "unknown"),
@@ -124,6 +127,14 @@ async def evaluate_example(
                 int(result.get("search_failure_count", 0))
                 for result in outputs.get("dimension_results", [])
             ),
+            "material_conflicts": sum(
+                bool(conflict.get("material"))
+                for conflict in outputs.get("claim_conflicts", [])
+            ),
+            "consistency_audit_passed": outputs.get("report_consistency_audit", {}).get(
+                "passes", False
+            ),
+            "safe_fallback_used": outputs.get("report_safe_fallback_used", False),
         },
     }
 

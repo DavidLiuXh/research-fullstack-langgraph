@@ -59,8 +59,11 @@ def test_deterministic_evaluator_scores_valid_evidence_and_trajectory():
         "gap_status_updated",
         "reflection_completed",
         "claims_extracted",
+        "report_evidence_prepared",
+        "claim_conflicts_detected",
         "drafting_report",
         "report_audit_completed",
+        "report_consistency_audited",
         "finalizing_answer",
     ]
     outputs = {
@@ -113,6 +116,9 @@ def test_deterministic_evaluator_scores_valid_evidence_and_trajectory():
         "node_trajectory": [],
         "report_revision_count": 1,
         "max_report_revisions": 1,
+        "consistency_analysis_complete": True,
+        "claim_conflicts": [],
+        "report_consistency_audit": {"omitted_conflict_ids": []},
     }
     scores = _scores_by_key(
         evaluate_deterministic_quality(
@@ -148,6 +154,53 @@ def test_claim_evidence_coverage_requires_a_quote_present_in_its_source():
     scores = _scores_by_key(evaluate_deterministic_quality({"messages": []}, outputs))
 
     assert scores["claim_evidence_coverage"] == 0
+
+
+def test_deterministic_evaluator_does_not_fall_back_past_empty_report_ledger():
+    outputs = {
+        "report_draft": "Rejected marker [Srejected].",
+        "report_sources": [],
+        "report_dimension_results": [],
+        "sources": [
+            {
+                "source_id": "Srejected",
+                "quality_status": "rejected",
+                "content": "Rejected content.",
+            }
+        ],
+        "dimension_results": [{"claims": [{"supporting_source_ids": ["Srejected"]}]}],
+    }
+
+    scores = _scores_by_key(evaluate_deterministic_quality({}, outputs))
+
+    assert scores["citation_validity"] == 0
+    assert scores["accepted_evidence_isolation"] == 0
+
+
+def test_material_conflict_disclosure_checks_final_report_not_stale_audit():
+    conflict = {
+        "conflict_id": "CF-1",
+        "material": True,
+        "left_source_ids": ["S1"],
+        "right_source_ids": ["S2"],
+    }
+    outputs = {
+        "report_draft": "CF-1 presents both accepted positions [S1] [S2].",
+        "report_sources": [
+            {"source_id": "S1", "quality_status": "accepted"},
+            {"source_id": "S2", "quality_status": "accepted"},
+        ],
+        "report_dimension_results": [],
+        "claim_conflicts": [conflict],
+        "report_consistency_audit": {
+            "passes": False,
+            "omitted_conflict_ids": ["CF-1"],
+        },
+    }
+
+    scores = _scores_by_key(evaluate_deterministic_quality({}, outputs))
+
+    assert scores["material_conflict_disclosure"] == 1
     assert scores["exact_quote_validity"] == 0
 
 

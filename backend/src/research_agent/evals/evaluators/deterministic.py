@@ -24,10 +24,18 @@ def evaluate_deterministic_quality(
     """Return low-cost regression metrics without an LLM judge."""
     del inputs
     reference = reference_outputs or {}
-    sources = outputs.get("sources", [])
+    sources = (
+        outputs.get("report_sources", [])
+        if "report_sources" in outputs
+        else outputs.get("sources", [])
+    )
     source_ids = {source.get("source_id") for source in sources}
     source_by_id = {source.get("source_id"): source for source in sources}
-    dimensions = outputs.get("dimension_results", [])
+    dimensions = (
+        outputs.get("report_dimension_results", [])
+        if "report_dimension_results" in outputs
+        else outputs.get("dimension_results", [])
+    )
     claims = [claim for result in dimensions for claim in result.get("claims", [])]
     claim_source_ids = [
         source_id
@@ -42,6 +50,13 @@ def evaluate_deterministic_quality(
     valid_claim_ids = [
         source_id for source_id in claim_source_ids if source_id in source_ids
     ]
+    accepted_source_ids = {
+        source.get("source_id")
+        for source in sources
+        if source.get("quality_status") == "accepted"
+    }
+    report_evidence_ids = set(draft_markers) | set(claim_source_ids)
+    accepted_report_evidence_ids = report_evidence_ids & accepted_source_ids
 
     selected = [
         source
@@ -143,8 +158,11 @@ def evaluate_deterministic_quality(
         "gap_status_updated",
         "reflection_completed",
         "claims_extracted",
+        "report_evidence_prepared",
+        "claim_conflicts_detected",
         "drafting_report",
         "report_audit_completed",
+        "report_consistency_audited",
         "finalizing_answer",
     }
     observed_required_events = required_events & event_types
@@ -156,6 +174,24 @@ def evaluate_deterministic_quality(
     )
     revision_count = int(outputs.get("report_revision_count", 0))
     max_revisions = int(outputs.get("max_report_revisions", 0))
+    material_conflicts = [
+        conflict
+        for conflict in outputs.get("claim_conflicts", [])
+        if conflict.get("material")
+    ]
+    disclosed_material_conflicts = [
+        conflict
+        for conflict in material_conflicts
+        if conflict.get("conflict_id") in outputs.get("report_draft", "")
+        and any(
+            f"[{source_id}]" in outputs.get("report_draft", "")
+            for source_id in conflict.get("left_source_ids", [])
+        )
+        and any(
+            f"[{source_id}]" in outputs.get("report_draft", "")
+            for source_id in conflict.get("right_source_ids", [])
+        )
+    ]
 
     comments = []
     if draft_markers and len(valid_markers) != len(draft_markers):
@@ -168,6 +204,17 @@ def evaluate_deterministic_quality(
             "citation_validity",
             _ratio(len(valid_markers), len(draft_markers), empty=0.0),
             "; ".join(comments) or "All emitted citation markers are valid.",
+        ),
+        _score(
+            "accepted_evidence_isolation",
+            _ratio(
+                len(accepted_report_evidence_ids),
+                len(report_evidence_ids),
+                empty=1.0,
+            ),
+            "Every report and claim source is accepted evidence."
+            if accepted_report_evidence_ids == report_evidence_ids
+            else "Rejected, supplementary, or unknown evidence reached report material.",
         ),
         _score(
             "claim_source_validity",
@@ -243,5 +290,18 @@ def evaluate_deterministic_quality(
             "revision_budget_compliance",
             float(revision_count <= max_revisions),
             f"revisions={revision_count}, limit={max_revisions}",
+        ),
+        _score(
+            "consistency_analysis_completion",
+            float(outputs.get("consistency_analysis_complete", False)),
+        ),
+        _score(
+            "material_conflict_disclosure",
+            _ratio(
+                len(disclosed_material_conflicts),
+                len(material_conflicts),
+                empty=1.0,
+            ),
+            f"{len(disclosed_material_conflicts)}/{len(material_conflicts)} material conflicts are explicitly disclosed with both evidence sides.",
         ),
     ]

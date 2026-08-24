@@ -55,6 +55,7 @@ class EvidenceQuote(TypedDict):
 
 
 class EvidenceClaim(TypedDict):
+    claim_id: NotRequired[str]
     claim: str
     supporting_source_ids: list[str]
     supporting_evidence: list[EvidenceQuote]
@@ -117,6 +118,13 @@ class OverallState(TypedDict):
     report_audit: dict
     report_revision_count: int
     max_report_revisions: int
+    report_dimension_results: list[DimensionResult]
+    report_sources: list[ResearchSource]
+    report_evidence_ledger: dict
+    claim_conflicts: list[dict]
+    consistency_analysis_complete: bool
+    report_consistency_audit: dict
+    report_safe_fallback_used: bool
 
 
 class DimensionState(TypedDict):

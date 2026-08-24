@@ -36,7 +36,33 @@ SOURCE_TYPE_ALIASES = {
     "standards": "standards_body",
     "standard": "standards_body",
     "industry report": "research_institute",
+    "industry media": "specialist_media",
+    "trade media": "specialist_media",
+    "trade publication": "specialist_media",
+    "industry publication": "specialist_media",
+    "specialist publication": "specialist_media",
+    "news media": "major_media",
+    "mainstream media": "major_media",
+    "news outlet": "major_media",
+    "company website": "official_company",
+    "corporate website": "official_company",
+    "official website": "official_company",
+    "think tank": "research_institute",
+    "market research": "commercial_report",
+    "industry body": "industry_association",
+    "international organization": "international_organization",
 }
+
+
+def normalize_source_type(value: object) -> str:
+    """Map common provider taxonomy variants to the closed source vocabulary."""
+    normalized = re.sub(
+        r"\s+", " ", str(value or "").casefold().replace("_", " ").replace("-", " ")
+    ).strip()
+    canonical = normalized.replace(" ", "_")
+    if canonical in SOURCE_TYPE_VALUES:
+        return canonical
+    return SOURCE_TYPE_ALIASES.get(normalized, "unknown")
 
 
 class TopicClarificationAssessment(BaseModel):
@@ -114,6 +140,12 @@ class SourceAssessment(BaseModel):
     supported_topics: list[str]
     rejection_reasons: list[str]
 
+    @field_validator("source_type", mode="before")
+    @classmethod
+    def normalize_provider_source_type(cls, value):
+        """Normalize reasonable provider aliases without relaxing the vocabulary."""
+        return normalize_source_type(value)
+
 
 class SourceAssessmentList(BaseModel):
     assessments: list[SourceAssessment]
@@ -181,9 +213,7 @@ class ResearchGap(BaseModel):
             source_types = [source_types]
         normalized["required_source_types"] = list(
             dict.fromkeys(
-                source_type
-                if source_type in SOURCE_TYPE_VALUES
-                else SOURCE_TYPE_ALIASES.get(source_type.casefold().strip(), "unknown")
+                normalize_source_type(source_type)
                 for item in source_types
                 for source_type in [str(item).casefold().strip()]
             )
@@ -510,4 +540,48 @@ class ReportAudit(BaseModel):
             raise ValueError("A passing report audit cannot contain findings")
         if not self.passes and not self.revision_instructions:
             raise ValueError("A failing report audit requires revision instructions")
+        return self
+
+
+class ClaimConflictItem(BaseModel):
+    """One normalized relation between two audited claims."""
+
+    left_claim_id: str
+    right_claim_id: str
+    relation: Literal[
+        "contradiction", "scope_difference", "temporal_change", "compatible"
+    ]
+    severity: Literal["low", "medium", "high"] = "medium"
+    resolution_status: Literal["resolved", "unresolved"] = "unresolved"
+    explanation: str = ""
+    required_treatment: str = ""
+
+
+class ClaimConflictAnalysis(BaseModel):
+    """Compact cross-dimension consistency analysis."""
+
+    conflicts: list[ClaimConflictItem] = Field(default_factory=list)
+
+
+class ReportConsistencyAudit(BaseModel):
+    """Check whether a report handles every material evidence conflict."""
+
+    passes: bool
+    covered_conflict_ids: list[str] = Field(default_factory=list)
+    omitted_conflict_ids: list[str] = Field(default_factory=list)
+    new_contradictions: list[str] = Field(default_factory=list)
+    issues: list[str] = Field(default_factory=list)
+    revision_instructions: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_pass_status(self):
+        """Reject passing consistency audits that retain material findings."""
+        if self.passes and (
+            self.omitted_conflict_ids or self.new_contradictions or self.issues
+        ):
+            raise ValueError("A passing consistency audit cannot contain findings")
+        if not self.passes and not self.revision_instructions:
+            self.revision_instructions = [
+                "Reconcile or explicitly disclose every material contradiction."
+            ]
         return self
