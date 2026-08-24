@@ -125,6 +125,17 @@ class ResearchEvaluationTarget:
             "research_dimensions": final_state.get("research_dimensions", []),
             "dimension_results": final_state.get("dimension_results", []),
             "sources": final_state.get("sources_gathered", []),
+            "report_dimension_results": final_state.get("report_dimension_results", []),
+            "report_sources": final_state.get("report_sources", []),
+            "report_evidence_ledger": final_state.get("report_evidence_ledger", {}),
+            "claim_conflicts": final_state.get("claim_conflicts", []),
+            "consistency_analysis_complete": final_state.get(
+                "consistency_analysis_complete", False
+            ),
+            "report_consistency_audit": final_state.get("report_consistency_audit", {}),
+            "report_safe_fallback_used": final_state.get(
+                "report_safe_fallback_used", False
+            ),
             "report_generation_mode": final_state.get(
                 "report_generation_mode", "unknown"
             ),

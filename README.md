@@ -65,15 +65,34 @@ the current implementation.
    This loop continues until the user approves the plan.
 6. **Parallel dimension research.** The parent graph dispatches one isolated
    subgraph for every approved dimension.
-7. **Draft the report.** Completed, evidence-backed claim sets are filtered to
-   the current research run and synthesized into a draft report.
-8. **Audit and revise.** An independent structured audit checks coverage,
-   factual support, citations, uncertainty, counterarguments, and clarity. A
-   failed audit returns the draft to revision while the bounded revision budget
-   remains.
-9. **Finalize the answer.** The final node validates source markers, renders
-   citations, and publishes the cited research report when the audit passes or
-   the revision limit is reached.
+7. **Prepare the report evidence ledger.** Before any report model runs, the
+   graph creates a fail-closed, current-run-only ledger. Only explicitly
+   accepted sources survive; every evidence quote is revalidated against its
+   source, claims without valid supporting evidence are removed, and stable
+   claim IDs are assigned. Rejected and supplementary source content cannot
+   enter drafting, auditing, revision, fallback generation, or citation
+   rendering.
+8. **Detect claim conflicts.** DeepSeek compares the sanitized claims across
+   dimensions and produces a validated conflict ledger. The graph distinguishes
+   true contradictions from scope differences and temporal changes, and marks
+   unresolved medium- or high-severity contradictions as material.
+9. **Draft the report.** The sanitized claims and conflict ledger are
+   synthesized into a report. Every material conflict must present both
+   accepted-evidence sides, retain uncertainty, and name its stable conflict ID.
+10. **Audit and revise.** The normal report audit checks coverage, factual
+    support, citations, uncertainty, counterarguments, and clarity. A separate
+    consistency audit checks conflict disclosure and report-introduced
+    contradictions. Deterministic checks independently require both sides'
+    citations and the conflict ID, so a model cannot incorrectly pass a silent
+    contradiction. Failed audits return to bounded revision.
+11. **Use a safe fallback when needed.** If the audit still fails after the
+    revision budget is exhausted, the graph builds a deterministic report from
+    the sanitized claim ledger and explicitly lists both sides of every material
+    unresolved conflict. An unaudited model draft is never published merely
+    because the retry limit was reached.
+12. **Finalize the answer.** The final node renders citations from report-ledger
+    sources only and publishes either an audited report or the deterministic
+    safe fallback.
 
 ### Dimension subgraph
 

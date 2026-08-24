@@ -9,6 +9,8 @@ from research_agent.graph import (
     analyze_research_topic,
     assess_gap_evidence,
     audit_report,
+    build_safe_report,
+    detect_claim_conflicts,
     dimension_reflection,
     dispatch_research_dimensions,
     draft_report,
@@ -20,6 +22,7 @@ from research_agent.graph import (
     initialize_research_topic,
     merge_gap_registry,
     plan_initial_gaps,
+    prepare_report_evidence,
     replan_search,
     request_topic_clarification,
     review_research_dimensions,
@@ -36,6 +39,8 @@ from research_agent.graph import (
     web_research,
 )
 from research_agent.tools_and_schemas import (
+    ClaimConflictAnalysis,
+    ClaimConflictItem,
     ClaimExtraction,
     EvidenceClaim,
     EvidenceConflict,
@@ -43,6 +48,7 @@ from research_agent.tools_and_schemas import (
     GapEvidenceAssessment,
     Reflection,
     ReportAudit,
+    ReportConsistencyAudit,
     ResearchDimension,
     ResearchDimensionList,
     ResearchGap,
@@ -88,6 +94,8 @@ def _report_state(*, dimensions=2, claims_per_dimension=1, topic="Research topic
                 "title": f"Source {source_id}",
                 "url": f"https://example.com/{source_id}",
                 "content": f"Verified evidence for claim {claim_index}.",
+                "quality_status": "accepted",
+                "evidence_score": 0.9,
             }
             sources.append(source)
             dimension_sources.append(source)
@@ -682,6 +690,77 @@ def test_incomplete_dimension_reflection_cannot_exit_without_an_actionable_gap(
     )
 
 
+def test_dimension_reflection_never_receives_nonaccepted_source_content(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+    prompts = []
+
+    class CapturingModel:
+        def with_structured_output(self, schema, method):
+            return self
+
+        def invoke(self, prompt):
+            prompts.append(prompt)
+            return Reflection(
+                is_sufficient=True,
+                covered_questions=["Scope covered"],
+                missing_questions=[],
+                unsupported_claims=[],
+                contradictions=[],
+                source_quality_issues=[],
+                recommended_search_strategy=[],
+                do_not_repeat=[],
+                completion_reason="Accepted evidence is sufficient.",
+                confidence=0.9,
+            )
+
+    monkeypatch.setattr(
+        graph_module, "create_deepseek_model", lambda *a, **k: CapturingModel()
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    accepted = [
+        _accepted_source("S1", "one.gov"),
+        _accepted_source("S2", "two.gov"),
+    ]
+    supplementary = _accepted_source(
+        "S3",
+        "commentary.example",
+        quality_status="supplementary",
+        content="SUPPLEMENTARY_SECRET_CONTENT",
+        rejection_reasons=["Below acceptance threshold"],
+    )
+    rejected = _accepted_source(
+        "S4",
+        "rejected.example",
+        quality_status="rejected",
+        content="REJECTED_SECRET_CONTENT",
+        rejection_reasons=["Low authority"],
+    )
+
+    dimension_reflection(
+        _dimension_state(
+            gap_registry={"gap-one": _gap_record(status="closed")},
+            selected_sources=[*accepted, supplementary],
+            rejected_sources=[rejected],
+            reflection_history=[],
+            query_history=[],
+            evidence_gain_history=[],
+            dimension_reflection_count=0,
+        ),
+        {
+            "configurable": {
+                "min_accepted_sources_per_dimension": 2,
+                "min_authoritative_sources_per_dimension": 1,
+                "min_primary_sources_per_dimension": 1,
+            }
+        },
+    )
+
+    assert "SUPPLEMENTARY_SECRET_CONTENT" not in prompts[0]
+    assert "REJECTED_SECRET_CONTENT" not in prompts[0]
+    assert "Below acceptance threshold" in prompts[0]
+    assert "Low authority" in prompts[0]
+
+
 def test_dimension_subgraph_contains_complete_gap_lifecycle():
     graph_module = importlib.import_module("research_agent.graph")
     node_names = set(graph_module.dimension_subgraph.get_graph().nodes)
@@ -880,9 +959,12 @@ def test_compiled_parent_graph_has_dimension_pipeline():
         "request_topic_clarification",
         "review_research_dimensions",
         "research_dimension",
+        "prepare_report_evidence",
+        "detect_claim_conflicts",
         "draft_report",
         "audit_report",
         "revise_report",
+        "build_safe_report",
         "finalize_answer",
     }.issubset(graph.nodes)
 
@@ -1000,12 +1082,16 @@ def test_parent_graph_runs_parallel_dimension_subgraphs(monkeypatch):
                     ],
                     summary="Supported dimension summary.",
                 )
+            if self.schema is ClaimConflictAnalysis:
+                return ClaimConflictAnalysis(conflicts=[])
             if self.schema is ReportAudit:
                 return ReportAudit(
                     passes=True,
                     issues=[],
                     revision_instructions=[],
                 )
+            if self.schema is ReportConsistencyAudit:
+                return ReportConsistencyAudit(passes=True)
             source_ids = list(
                 dict.fromkeys(re.findall(r"\[(S[A-Za-z0-9-]+)\]", prompt))
             )
@@ -1133,8 +1219,15 @@ def test_final_answer_uses_only_current_research_run(monkeypatch):
                 {
                     "claim": "Current fact",
                     "supporting_source_ids": ["Snew-0-0-0-0"],
-                    "supporting_evidence": content,
+                    "supporting_evidence": [
+                        {
+                            "source_id": "Snew-0-0-0-0",
+                            "quote": content,
+                            "locator": "chars:0-30",
+                        }
+                    ],
                     "contradicting_source_ids": [],
+                    "contradicting_evidence": [],
                     "confidence": 0.9,
                     "uncertainty_reason": "",
                 }
@@ -1149,6 +1242,7 @@ def test_final_answer_uses_only_current_research_run(monkeypatch):
             "title": f"{run_id} source",
             "url": f"https://example.com/{run_id}",
             "content": content,
+            "quality_status": "accepted",
         }
 
     result = finalize_answer(
@@ -1161,8 +1255,8 @@ def test_final_answer_uses_only_current_research_run(monkeypatch):
                 dimension_result("new", "NEW DIMENSION CONTENT"),
             ],
             "sources_gathered": [
-                source("old", "Sold-0-0-0-0", "OLD SOURCE CONTENT"),
-                source("new", "Snew-0-0-0-0", "NEW SOURCE CONTENT"),
+                source("old", "Sold-0-0-0-0", "OLD DIMENSION CONTENT"),
+                source("new", "Snew-0-0-0-0", "NEW DIMENSION CONTENT"),
             ],
             "reasoning_model": "deepseek-v4-pro",
             "report_draft": ("Current fact [Snew-0-0-0-0]. Old marker [Sold-0-0-0-0]."),
@@ -1237,6 +1331,67 @@ def test_source_quality_selection_rejects_unassessed_and_excess_domain_sources(
         "S2",
         "Sunassessed",
     }
+
+
+def test_source_assessment_normalizes_deepseek_industry_media_alias():
+    assessment = SourceAssessment.model_validate(
+        {
+            "source_id": "S1",
+            "source_type": "industry_media",
+            "authority_score": 0.5,
+            "relevance_score": 0.9,
+            "recency_score": 0.9,
+            "is_primary_source": False,
+            "is_likely_repost": False,
+            "supported_topics": ["market"],
+            "rejection_reasons": [],
+        }
+    )
+
+    assert assessment.source_type == "specialist_media"
+
+
+def test_unknown_source_type_cannot_use_model_scores_to_become_accepted(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class UnknownTypeModel:
+        def with_structured_output(self, schema, method):
+            return self
+
+        def invoke(self, prompt):
+            return SourceAssessmentList(
+                assessments=[
+                    SourceAssessment(
+                        source_id="Sunknown",
+                        source_type="unknown",
+                        authority_score=1.0,
+                        relevance_score=1.0,
+                        recency_score=1.0,
+                        is_primary_source=True,
+                        is_likely_repost=False,
+                        supported_topics=["market"],
+                        rejection_reasons=[],
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(
+        graph_module, "create_deepseek_model", lambda *a, **k: UnknownTypeModel()
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    source = _accepted_source(
+        "Sunknown",
+        "unknown.example",
+        quality_status=None,
+        source_type=None,
+    )
+
+    result = evaluate_sources(_dimension_state(sources_gathered=[source]), {})
+
+    evaluated = result["evaluated_sources"][0]
+    assert evaluated["authority_score"] == 0.4
+    assert evaluated["is_primary_source"] is False
+    assert evaluated["quality_status"] == "supplementary"
 
 
 def test_source_selection_prioritizes_requested_authoritative_type(monkeypatch):
@@ -1396,7 +1551,7 @@ def test_report_audit_route_is_bounded():
                 "max_report_revisions": 2,
             }
         )
-        == "finalize_answer"
+        == "build_safe_report"
     )
 
 
@@ -1673,11 +1828,15 @@ def test_report_audit_rejects_unknown_source_markers(monkeypatch):
     graph_module = importlib.import_module("research_agent.graph")
 
     class PassingAuditModel:
+        schema = None
+
         def with_structured_output(self, schema, method):
-            assert schema is ReportAudit
+            self.schema = schema
             return self
 
         def invoke(self, prompt):
+            if self.schema is ReportConsistencyAudit:
+                return ReportConsistencyAudit(passes=True)
             return ReportAudit(
                 passes=True,
                 issues=[],
@@ -1721,7 +1880,6 @@ def test_report_audit_length_limit_uses_conservative_fallback(monkeypatch):
 
     class LengthLimitedAuditModel:
         def with_structured_output(self, schema, method):
-            assert schema is ReportAudit
             return self
 
         def invoke(self, prompt):
@@ -1752,6 +1910,7 @@ def test_report_audit_length_limit_uses_conservative_fallback(monkeypatch):
     assert [event["type"] for event in events] == [
         "report_audit_fallback",
         "report_audit_completed",
+        "report_consistency_audited",
     ]
 
 
@@ -1792,6 +1951,191 @@ def test_report_audit_schema_recovers_wrapped_alternative_fields():
     assert "Unknown marker: It is absent." in audit.issues
     assert "Duplicated section: Tighten it." in audit.issues
     assert audit.revision_instructions == ["Correct and qualify the findings."]
+
+
+def test_report_evidence_ledger_rejects_nonaccepted_sources(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    state = _report_state(dimensions=1)
+    rejected_source = {
+        **state["sources_gathered"][0],
+        "source_id": "Srejected",
+        "title": "Rejected source",
+        "url": "https://rejected.example/source",
+        "content": "Rejected evidence must never enter the report.",
+        "quality_status": "rejected",
+    }
+    state["sources_gathered"].append(rejected_source)
+    state["dimension_results"][0]["sources"].append(rejected_source)
+    state["dimension_results"][0]["claims"].append(
+        {
+            "claim": "A rejected-only claim.",
+            "supporting_source_ids": ["Srejected"],
+            "supporting_evidence": [
+                {
+                    "source_id": "Srejected",
+                    "quote": rejected_source["content"],
+                    "locator": "chars:0-47",
+                }
+            ],
+            "contradicting_source_ids": [],
+            "contradicting_evidence": [],
+            "confidence": 0.8,
+            "uncertainty_reason": "",
+        }
+    )
+
+    prepared = prepare_report_evidence(state, {})
+
+    assert [source["source_id"] for source in prepared["report_sources"]] == ["S0-0"]
+    assert len(prepared["report_dimension_results"][0]["claims"]) == 1
+    assert prepared["report_evidence_ledger"]["rejected_source_ids"] == ["Srejected"]
+    assert prepared["report_evidence_ledger"]["rejected_claim_count"] == 1
+
+    finalized = finalize_answer(
+        {
+            **state,
+            **prepared,
+            "report_draft": "Accepted [S0-0]. Rejected [Srejected].",
+        }
+    )
+    assert "https://example.com/S0-0" in finalized["messages"][0].content
+    assert "rejected.example" not in finalized["messages"][0].content
+
+
+def test_detect_claim_conflicts_builds_validated_material_ledger(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class ConflictModel:
+        def with_structured_output(self, schema, method):
+            assert schema is ClaimConflictAnalysis
+            return self
+
+        def invoke(self, prompt):
+            return ClaimConflictAnalysis(
+                conflicts=[
+                    ClaimConflictItem(
+                        left_claim_id="C-0-1",
+                        right_claim_id="C-1-1",
+                        relation="contradiction",
+                        severity="high",
+                        resolution_status="unresolved",
+                        explanation="The same scoped value differs.",
+                        required_treatment="Present both values and uncertainty.",
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(
+        graph_module, "create_deepseek_model", lambda *a, **k: ConflictModel()
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    state = _report_state(dimensions=2)
+    prepared = prepare_report_evidence(state, {})
+
+    result = detect_claim_conflicts({**state, **prepared}, {})
+
+    assert result["consistency_analysis_complete"] is True
+    assert result["claim_conflicts"] == [
+        {
+            "conflict_id": "CF-1",
+            "left_claim_id": "C-0-1",
+            "right_claim_id": "C-1-1",
+            "relation": "contradiction",
+            "severity": "high",
+            "resolution_status": "unresolved",
+            "explanation": "The same scoped value differs.",
+            "required_treatment": "Present both values and uncertainty.",
+            "left_source_ids": ["S0-0"],
+            "right_source_ids": ["S1-0"],
+            "material": True,
+        }
+    ]
+
+
+def test_report_consistency_audit_requires_explicit_conflict_disclosure(
+    monkeypatch,
+):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class PassingModels:
+        schema = None
+
+        def with_structured_output(self, schema, method):
+            self.schema = schema
+            return self
+
+        def invoke(self, prompt):
+            if self.schema is ReportConsistencyAudit:
+                return ReportConsistencyAudit(
+                    passes=True, covered_conflict_ids=["CF-1"]
+                )
+            return ReportAudit(passes=True)
+
+    monkeypatch.setattr(
+        graph_module, "create_deepseek_model", lambda *a, **k: PassingModels()
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    state = _report_state(dimensions=2)
+    prepared = prepare_report_evidence(state, {})
+    conflict = {
+        "conflict_id": "CF-1",
+        "left_claim_id": "C-0-1",
+        "right_claim_id": "C-1-1",
+        "relation": "contradiction",
+        "severity": "high",
+        "resolution_status": "unresolved",
+        "explanation": "Values differ.",
+        "required_treatment": "Present both.",
+        "left_source_ids": ["S0-0"],
+        "right_source_ids": ["S1-0"],
+        "material": True,
+    }
+
+    result = audit_report(
+        {
+            **state,
+            **prepared,
+            "claim_conflicts": [conflict],
+            "consistency_analysis_complete": True,
+            "report_draft": "Two conclusions are cited [S0-0] [S1-0], without disclosure.",
+            "report_revision_count": 0,
+        },
+        {},
+    )
+
+    assert result["report_audit"]["passes"] is False
+    assert result["report_consistency_audit"]["omitted_conflict_ids"] == ["CF-1"]
+
+
+def test_safe_report_discloses_both_sides_of_material_conflict(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    state = _report_state(dimensions=2, topic="中文研究主题")
+    prepared = prepare_report_evidence(state, {})
+    conflict = {
+        "conflict_id": "CF-1",
+        "left_claim_id": "C-0-1",
+        "right_claim_id": "C-1-1",
+        "relation": "contradiction",
+        "severity": "high",
+        "resolution_status": "unresolved",
+        "explanation": "Values differ.",
+        "required_treatment": "Present both.",
+        "left_source_ids": ["S0-0"],
+        "right_source_ids": ["S1-0"],
+        "material": True,
+    }
+
+    result = build_safe_report({**state, **prepared, "claim_conflicts": [conflict]}, {})
+
+    assert result["report_generation_mode"] == "safe_fallback"
+    assert result["report_safe_fallback_used"] is True
+    assert result["report_consistency_audit"]["passes"] is True
+    assert result["report_consistency_audit"]["covered_conflict_ids"] == ["CF-1"]
+    assert "CF-1" in result["report_draft"]
+    assert "[S0-0]" in result["report_draft"]
+    assert "[S1-0]" in result["report_draft"]
 
 
 def test_claim_extraction_skips_model_when_no_screened_evidence(monkeypatch):

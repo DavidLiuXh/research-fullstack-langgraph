@@ -9,7 +9,7 @@ import sys
 import time
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import uuid4
 
 # The CLI executes this file by path, so the src-layout package root is not
@@ -32,6 +32,7 @@ from research_agent.configuration import Configuration
 from research_agent.llm import create_deepseek_model
 from research_agent.prompts import (
     answer_instructions,
+    claim_conflict_instructions,
     claim_extraction_instructions,
     dimension_instructions,
     gap_evidence_assessment_instructions,
@@ -40,6 +41,7 @@ from research_agent.prompts import (
     query_writer_instructions,
     reflection_instructions,
     report_audit_instructions,
+    report_consistency_audit_instructions,
     report_overview_instructions,
     report_overview_revision_instructions,
     report_revision_instructions,
@@ -54,13 +56,16 @@ from research_agent.state import (
     DimensionState,
     OverallState,
     QueryGenerationState,
+    ResearchSource,
     WebSearchState,
 )
 from research_agent.tools_and_schemas import (
+    ClaimConflictAnalysis,
     ClaimExtraction,
     GapEvidenceAssessment,
     Reflection,
     ReportAudit,
+    ReportConsistencyAudit,
     ResearchDimensionList,
     ResearchGap,
     ResearchGapPlan,
@@ -804,6 +809,13 @@ def evaluate_sources(state: DimensionState, config: RunnableConfig):
             source_type = assessment.source_type
             supported_topics = assessment.supported_topics
             rejection_reasons = assessment.rejection_reasons
+        if source_type == "unknown":
+            authority = min(authority, 0.4)
+            primary = False
+            rejection_reasons = [
+                *rejection_reasons,
+                "The provider source type was unrecognized; authority was capped conservatively.",
+            ]
         requested_source_types = source.get("requested_source_types", [])
         matches_requested_source_type = (
             not requested_source_types or source_type in requested_source_types
@@ -1337,15 +1349,23 @@ def dimension_reflection(state: DimensionState, config: RunnableConfig):
             ),
         },
     }
+    nonaccepted = deduplicate_sources_by_id(
+        [
+            *[
+                source
+                for source in selected
+                if source.get("quality_status") != "accepted"
+            ],
+            *state.get("rejected_sources", []),
+        ]
+    )
     prompt = reflection_instructions.format(
         research_topic=state["research_topic"],
         dimension_title=state["dimension"]["title"],
         dimension_scope=state["dimension"]["scope"],
         gap_registry=json.dumps(registry, ensure_ascii=False),
-        summaries=format_sources_for_research(selected),
-        rejected_source_summary=format_rejected_source_summary(
-            state.get("rejected_sources", [])
-        ),
+        summaries=format_sources_for_research(accepted),
+        rejected_source_summary=format_rejected_source_summary(nonaccepted),
         previous_reflection=json.dumps(
             state.get("reflection_history", [])[-1:] or [], ensure_ascii=False
         ),
@@ -1925,6 +1945,298 @@ def _current_research_material(state: OverallState):
     )
 
 
+def _build_report_evidence(
+    state: OverallState, configurable: Configuration
+) -> tuple[list[DimensionResult], list[ResearchSource], dict[str, Any]]:
+    """Build a fail-closed report ledger from final accepted evidence only."""
+    current_results, current_sources, _ = _current_research_material(state)
+    source_candidates = deduplicate_sources_by_id(
+        [
+            *current_sources,
+            *[
+                source
+                for result in current_results
+                for source in result.get("sources", [])
+            ],
+        ]
+    )
+    accepted_sources = [
+        source
+        for source in source_candidates
+        if source.get("quality_status") == "accepted"
+    ]
+    accepted_by_id = {source["source_id"]: source for source in accepted_sources}
+    rejected_source_ids = sorted(
+        {
+            source["source_id"]
+            for source in source_candidates
+            if source.get("quality_status") != "accepted"
+        }
+    )
+    invalid_evidence_count = 0
+    rejected_claim_count = 0
+    report_results: list[DimensionResult] = []
+
+    def verified_evidence(items: object) -> list[dict]:
+        nonlocal invalid_evidence_count
+        verified: list[dict[str, str]] = []
+        if not isinstance(items, list):
+            return verified
+        for item in items:
+            if not isinstance(item, dict):
+                invalid_evidence_count += 1
+                continue
+            source_id = str(item.get("source_id", ""))
+            source = accepted_by_id.get(source_id)
+            located = (
+                locate_evidence_quote(
+                    str(source.get("content", "")),
+                    str(item.get("quote", "")),
+                    min_chars=configurable.min_evidence_quote_chars,
+                )
+                if source
+                else None
+            )
+            if located is None:
+                invalid_evidence_count += 1
+                continue
+            quote, locator = located
+            verified.append(
+                {"source_id": source_id, "quote": quote, "locator": locator}
+            )
+        return verified
+
+    for result in current_results:
+        dimension_id = str(result["dimension"]["id"])
+        claims = []
+        for claim_index, claim in enumerate(result.get("claims", [])):
+            supporting = verified_evidence(claim.get("supporting_evidence", []))
+            counter = verified_evidence(claim.get("contradicting_evidence", []))
+            if not supporting:
+                rejected_claim_count += 1
+                continue
+            claims.append(
+                {
+                    **claim,
+                    "claim_id": claim.get("claim_id")
+                    or f"C-{dimension_id}-{claim_index + 1}",
+                    "supporting_source_ids": list(
+                        dict.fromkeys(item["source_id"] for item in supporting)
+                    ),
+                    "supporting_evidence": supporting,
+                    "contradicting_source_ids": list(
+                        dict.fromkeys(item["source_id"] for item in counter)
+                    ),
+                    "contradicting_evidence": counter,
+                }
+            )
+        contradictions = []
+        for conflict in result.get("contradictions", []):
+            if not isinstance(conflict, dict):
+                continue
+            source_ids = [
+                source_id
+                for source_id in conflict.get("source_ids", [])
+                if source_id in accepted_by_id
+            ]
+            if source_ids:
+                contradictions.append({**conflict, "source_ids": source_ids})
+        report_results.append(
+            cast(
+                DimensionResult,
+                {
+                    **result,
+                    "sources": [
+                        source
+                        for source in result.get("sources", [])
+                        if source.get("quality_status") == "accepted"
+                        and source.get("source_id") in accepted_by_id
+                    ],
+                    "claims": claims,
+                    "contradictions": contradictions,
+                },
+            )
+        )
+
+    used_source_ids = {
+        source_id
+        for result in report_results
+        for claim in result.get("claims", [])
+        for source_id in [
+            *claim.get("supporting_source_ids", []),
+            *claim.get("contradicting_source_ids", []),
+        ]
+    }
+    report_sources = [
+        source for source in accepted_sources if source["source_id"] in used_source_ids
+    ]
+    ledger = {
+        "accepted_source_ids": sorted(accepted_by_id),
+        "report_source_ids": sorted(used_source_ids),
+        "rejected_source_ids": rejected_source_ids,
+        "accepted_claim_ids": [
+            claim["claim_id"]
+            for result in report_results
+            for claim in result.get("claims", [])
+        ],
+        "invalid_evidence_count": invalid_evidence_count,
+        "rejected_claim_count": rejected_claim_count,
+    }
+    return report_results, report_sources, ledger
+
+
+def prepare_report_evidence(state: OverallState, config: RunnableConfig):
+    """Create the immutable evidence boundary used by every report node."""
+    configurable = Configuration.from_runnable_config(config)
+    results, sources, ledger = _build_report_evidence(state, configurable)
+    emit_research_event(
+        "report_evidence_prepared",
+        research_run_id=state["research_run_id"],
+        accepted_source_count=len(ledger["accepted_source_ids"]),
+        report_source_count=len(sources),
+        claim_count=len(ledger["accepted_claim_ids"]),
+        rejected_claim_count=ledger["rejected_claim_count"],
+        invalid_evidence_count=ledger["invalid_evidence_count"],
+    )
+    return {
+        "report_dimension_results": results,
+        "report_sources": sources,
+        "report_evidence_ledger": ledger,
+    }
+
+
+def _report_research_material(
+    state: OverallState, configurable: Configuration | None = None
+) -> tuple[list[DimensionResult], list[ResearchSource], str]:
+    """Return only the prepared report ledger, building it for direct callers."""
+    if "report_dimension_results" in state and "report_sources" in state:
+        results = state.get("report_dimension_results", [])
+        sources = state.get("report_sources", [])
+    else:
+        results, sources, _ = _build_report_evidence(
+            state, configurable or Configuration()
+        )
+    return results, sources, format_dimension_results(results)
+
+
+def _claim_index(results: list[DimensionResult]) -> dict[str, dict]:
+    """Index prepared claims with their dimension context."""
+    return {
+        claim["claim_id"]: {
+            **claim,
+            "dimension_id": result["dimension"]["id"],
+            "dimension_title": result["dimension"]["title"],
+        }
+        for result in results
+        for claim in result.get("claims", [])
+        if claim.get("claim_id")
+    }
+
+
+def _format_conflict_ledger(conflicts: list[dict]) -> str:
+    """Render compact, identifier-stable conflicts for drafting and audit."""
+    if not conflicts:
+        return "No material cross-claim conflicts were detected."
+    return json.dumps(conflicts, ensure_ascii=False, indent=2)
+
+
+def detect_claim_conflicts(state: OverallState, config: RunnableConfig):
+    """Detect and validate cross-dimension claim conflicts before drafting."""
+    configurable = Configuration.from_runnable_config(config)
+    results, _, _ = _report_research_material(state, configurable)
+    claims_by_id = _claim_index(results)
+    if len(claims_by_id) < 2:
+        emit_research_event(
+            "claim_conflicts_detected",
+            research_run_id=state["research_run_id"],
+            conflict_count=0,
+            material_conflict_count=0,
+            analysis_complete=True,
+        )
+        return {"claim_conflicts": [], "consistency_analysis_complete": True}
+
+    compact_claims = [
+        {
+            "claim_id": claim_id,
+            "dimension": claim["dimension_title"],
+            "claim": claim["claim"],
+            "supporting_source_ids": claim.get("supporting_source_ids", []),
+            "uncertainty": claim.get("uncertainty_reason", ""),
+        }
+        for claim_id, claim in claims_by_id.items()
+    ]
+    prompt = claim_conflict_instructions.format(
+        output_schema=json.dumps(
+            ClaimConflictAnalysis.model_json_schema(), ensure_ascii=False
+        ),
+        research_topic=state["normalized_research_topic"],
+        claims=json.dumps(compact_claims, ensure_ascii=False),
+    )
+    structured_model = create_deepseek_model(
+        configurable.reflection_model
+    ).with_structured_output(ClaimConflictAnalysis, method="json_mode")
+    analysis_complete = True
+    try:
+        result = structured_model.invoke(prompt)
+        if not isinstance(result, ClaimConflictAnalysis):
+            raise TypeError("Conflict analysis returned an unexpected type")
+    except (LengthFinishReasonError, OutputParserException, TypeError, ValueError):
+        try:
+            result = structured_model.invoke(
+                prompt
+                + "\nThe previous response was invalid. Return only the compact JSON "
+                "object and omit compatible claim pairs."
+            )
+            if not isinstance(result, ClaimConflictAnalysis):
+                raise TypeError("Conflict analysis retry returned an unexpected type")
+        except (LengthFinishReasonError, OutputParserException, TypeError, ValueError):
+            result = ClaimConflictAnalysis(conflicts=[])
+            analysis_complete = False
+
+    conflicts: list[dict[str, Any]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for item in result.conflicts:
+        left_id = item.left_claim_id
+        right_id = item.right_claim_id
+        if (
+            left_id not in claims_by_id
+            or right_id not in claims_by_id
+            or left_id == right_id
+            or item.relation == "compatible"
+        ):
+            continue
+        pair = (left_id, right_id) if left_id < right_id else (right_id, left_id)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        left = claims_by_id[left_id]
+        right = claims_by_id[right_id]
+        conflicts.append(
+            {
+                "conflict_id": f"CF-{len(conflicts) + 1}",
+                **item.model_dump(),
+                "left_source_ids": left.get("supporting_source_ids", []),
+                "right_source_ids": right.get("supporting_source_ids", []),
+                "material": bool(
+                    item.relation == "contradiction"
+                    and item.resolution_status == "unresolved"
+                    and item.severity in {"medium", "high"}
+                ),
+            }
+        )
+    emit_research_event(
+        "claim_conflicts_detected",
+        research_run_id=state["research_run_id"],
+        conflict_count=len(conflicts),
+        material_conflict_count=sum(item["material"] for item in conflicts),
+        analysis_complete=analysis_complete,
+    )
+    return {
+        "claim_conflicts": conflicts,
+        "consistency_analysis_complete": analysis_complete,
+    }
+
+
 def _audited_claim_source_ids(results: list[DimensionResult]) -> set[str]:
     """Collect source IDs explicitly attached to audited claims."""
     return {
@@ -2018,6 +2330,7 @@ def _generate_report_section(
     research_topic: str,
     model: str,
     research_run_id: str,
+    conflicts: list[dict],
 ) -> str:
     """Generate one bounded section with compact retry and deterministic fallback."""
     dimension = result["dimension"]
@@ -2033,6 +2346,11 @@ def _generate_report_section(
             dimension_title=dimension["title"],
             dimension_scope=dimension["scope"],
             dimension_research=section_material,
+        ) + (
+            "\n\nCross-claim conflict ledger:\n"
+            + _format_conflict_ledger(conflicts)
+            + "\nExplicitly disclose every relevant material unresolved conflict, "
+            "including its conflict ID."
         )
 
     emit_research_event(
@@ -2091,6 +2409,7 @@ def _generate_sectioned_report(
     research_topic: str,
     model: str,
     research_run_id: str,
+    conflicts: list[dict],
 ) -> tuple[str, str, list[dict]]:
     """Generate bounded semantic sections and merge them without an LLM call."""
     emit_research_event(
@@ -2103,7 +2422,7 @@ def _generate_sectioned_report(
             "dimension_id": result["dimension"]["id"],
             "title": result["dimension"]["title"],
             "content": _generate_report_section(
-                result, research_topic, model, research_run_id
+                result, research_topic, model, research_run_id, conflicts
             ),
         }
         for result in results
@@ -2114,6 +2433,11 @@ def _generate_sectioned_report(
     overview_prompt = report_overview_instructions.format(
         research_topic=research_topic,
         dimension_research=overview_material,
+    ) + (
+        "\n\nCross-claim conflict ledger:\n"
+        + _format_conflict_ledger(conflicts)
+        + "\nDo not silently choose one side of an unresolved material conflict; "
+        "name its conflict ID when discussing it."
     )
     try:
         overview = str(
@@ -2161,7 +2485,8 @@ def draft_report(state: OverallState, config: RunnableConfig):
     """Draft the report from audited dimension claims."""
     configurable = Configuration.from_runnable_config(config)
     model = state.get("reasoning_model") or configurable.answer_model
-    current_results, _, material = _current_research_material(state)
+    current_results, _, material = _report_research_material(state, configurable)
+    conflicts = state.get("claim_conflicts", [])
     emit_research_event("drafting_report", research_run_id=state["research_run_id"])
     if _report_requires_sectioning(current_results, material, configurable):
         report_draft, overview, sections = _generate_sectioned_report(
@@ -2169,6 +2494,7 @@ def draft_report(state: OverallState, config: RunnableConfig):
             state["normalized_research_topic"],
             model,
             state["research_run_id"],
+            conflicts,
         )
         return {
             "report_draft": report_draft,
@@ -2182,6 +2508,11 @@ def draft_report(state: OverallState, config: RunnableConfig):
         current_date=get_current_date(),
         research_topic=state["normalized_research_topic"],
         dimension_research=material,
+    ) + (
+        "\n\nCross-claim conflict ledger:\n"
+        + _format_conflict_ledger(conflicts)
+        + "\nExplicitly reconcile or disclose every material unresolved conflict "
+        "and name its conflict ID."
     )
     try:
         result = create_deepseek_model(model).invoke(prompt)
@@ -2196,6 +2527,7 @@ def draft_report(state: OverallState, config: RunnableConfig):
             state["normalized_research_topic"],
             model,
             state["research_run_id"],
+            conflicts,
         )
         return {
             "report_draft": report_draft,
@@ -2217,6 +2549,7 @@ def draft_report(state: OverallState, config: RunnableConfig):
             state["normalized_research_topic"],
             model,
             state["research_run_id"],
+            conflicts,
         )
         return {
             "report_draft": report_draft,
@@ -2239,7 +2572,15 @@ def draft_report(state: OverallState, config: RunnableConfig):
 def audit_report(state: OverallState, config: RunnableConfig):
     """Independently audit report coverage, claims, and citations."""
     configurable = Configuration.from_runnable_config(config)
-    _, _, material = _current_research_material(state)
+    current_results, sources, _ = _report_research_material(state, configurable)
+    max_claims = max(
+        (len(result.get("claims", [])) for result in current_results), default=1
+    )
+    material = format_dimension_results(
+        current_results,
+        max_claims_per_dimension=max(1, max_claims),
+        max_evidence_chars=180,
+    )
     prompt = report_audit_instructions.format(
         research_topic=state["normalized_research_topic"],
         dimension_research=material,
@@ -2252,8 +2593,16 @@ def audit_report(state: OverallState, config: RunnableConfig):
             .with_structured_output(ReportAudit, method="json_mode")
             .invoke(prompt)
         )
+        if not isinstance(result, ReportAudit):
+            raise TypeError("Report audit returned an unexpected type")
         audit = result.model_dump()
-    except (LengthFinishReasonError, OutputParserException) as error:
+    except (
+        AttributeError,
+        LengthFinishReasonError,
+        OutputParserException,
+        TypeError,
+        ValueError,
+    ) as error:
         reason = (
             "length_limit"
             if isinstance(error, LengthFinishReasonError)
@@ -2273,7 +2622,6 @@ def audit_report(state: OverallState, config: RunnableConfig):
             research_run_id=state["research_run_id"],
             reason=reason,
         )
-    current_results, sources, _ = _current_research_material(state)
     valid_ids = {source["source_id"] for source in sources}
     claim_ids = _audited_claim_source_ids(current_results)
     cited_ids = set(re.findall(r"\[(S[A-Za-z0-9-]+)\]", state["report_draft"]))
@@ -2299,22 +2647,205 @@ def audit_report(state: OverallState, config: RunnableConfig):
             *audit["revision_instructions"],
             "Remove citations that are not attached to the audited claim set.",
         ]
+
+    conflicts = state.get("claim_conflicts", [])
+    conflict_prompt = report_consistency_audit_instructions.format(
+        output_schema=json.dumps(
+            ReportConsistencyAudit.model_json_schema(), ensure_ascii=False
+        ),
+        research_topic=state["normalized_research_topic"],
+        dimension_research=material,
+        conflict_ledger=_format_conflict_ledger(conflicts),
+        draft_report=state["report_draft"],
+    )
+    try:
+        consistency_result = (
+            create_deepseek_model(configurable.reflection_model)
+            .with_structured_output(ReportConsistencyAudit, method="json_mode")
+            .invoke(conflict_prompt)
+        )
+        if not isinstance(consistency_result, ReportConsistencyAudit):
+            raise TypeError("Consistency audit returned an unexpected type")
+        consistency_audit = consistency_result.model_dump()
+    except (
+        AttributeError,
+        LengthFinishReasonError,
+        OutputParserException,
+        TypeError,
+        ValueError,
+    ):
+        consistency_audit = ReportConsistencyAudit(
+            passes=False,
+            issues=["The independent consistency audit could not complete."],
+            revision_instructions=[
+                "Preserve both sides of every material conflict and state the uncertainty explicitly."
+            ],
+        ).model_dump()
+
+    valid_conflict_ids = {item["conflict_id"] for item in conflicts}
+    material_conflict_ids = {
+        item["conflict_id"] for item in conflicts if item.get("material")
+    }
+    consistency_audit["covered_conflict_ids"] = sorted(
+        set(consistency_audit.get("covered_conflict_ids", [])) & valid_conflict_ids
+    )
+    reported_omitted = set(consistency_audit.get("omitted_conflict_ids", []))
+    omitted_conflict_ids = (reported_omitted & valid_conflict_ids) | (
+        material_conflict_ids - set(consistency_audit["covered_conflict_ids"])
+    )
+    claims_by_id = _claim_index(current_results)
+    for conflict in conflicts:
+        if not conflict.get("material"):
+            continue
+        left = claims_by_id.get(conflict["left_claim_id"], {})
+        right = claims_by_id.get(conflict["right_claim_id"], {})
+        left_cited = bool(set(left.get("supporting_source_ids", [])) & cited_ids)
+        right_cited = bool(set(right.get("supporting_source_ids", [])) & cited_ids)
+        explicitly_identified = conflict["conflict_id"] in state["report_draft"]
+        if not (left_cited and right_cited and explicitly_identified):
+            omitted_conflict_ids.add(conflict["conflict_id"])
+    consistency_audit["omitted_conflict_ids"] = sorted(omitted_conflict_ids)
+    if omitted_conflict_ids:
+        consistency_audit["passes"] = False
+        consistency_audit["issues"] = [
+            *consistency_audit.get("issues", []),
+            "Material conflicts are not fully represented: "
+            + ", ".join(sorted(omitted_conflict_ids)),
+        ]
+        consistency_audit["revision_instructions"] = [
+            *consistency_audit.get("revision_instructions", []),
+            "Present both accepted-evidence sides of every omitted material conflict and explain why they differ.",
+        ]
+    if not state.get("consistency_analysis_complete", True):
+        consistency_audit["passes"] = False
+        consistency_audit["issues"] = [
+            *consistency_audit.get("issues", []),
+            "The pre-draft cross-claim consistency analysis was incomplete.",
+        ]
+        consistency_audit["revision_instructions"] = [
+            *consistency_audit.get("revision_instructions", []),
+            "Use conservative language and avoid a unique conclusion where accepted claims may conflict.",
+        ]
+    if not consistency_audit.get("passes"):
+        audit["passes"] = False
+        audit["issues"] = [
+            *audit["issues"],
+            *[f"Consistency: {issue}" for issue in consistency_audit["issues"]],
+        ]
+        audit["revision_instructions"] = [
+            *audit["revision_instructions"],
+            *consistency_audit["revision_instructions"],
+        ]
     emit_research_event(
         "report_audit_completed",
         research_run_id=state["research_run_id"],
         passes=audit["passes"],
         revision_count=state.get("report_revision_count", 0),
+        consistency_passes=consistency_audit["passes"],
+        omitted_conflict_count=len(consistency_audit["omitted_conflict_ids"]),
     )
-    return {"report_audit": audit}
+    emit_research_event(
+        "report_consistency_audited",
+        research_run_id=state["research_run_id"],
+        passes=consistency_audit["passes"],
+        covered_conflict_count=len(consistency_audit["covered_conflict_ids"]),
+        omitted_conflict_count=len(consistency_audit["omitted_conflict_ids"]),
+        new_contradiction_count=len(consistency_audit["new_contradictions"]),
+    )
+    return {
+        "report_audit": audit,
+        "report_consistency_audit": consistency_audit,
+    }
 
 
 def route_report_audit(state: OverallState):
-    """Revise material audit failures within a bounded loop."""
+    """Revise material failures or switch to a citation-safe final report."""
     if state["report_audit"].get("passes"):
         return "finalize_answer"
     if state.get("report_revision_count", 0) >= state.get("max_report_revisions", 2):
-        return "finalize_answer"
+        return "build_safe_report"
     return "revise_report"
+
+
+def build_safe_report(state: OverallState, config: RunnableConfig):
+    """Deterministically publish only validated claims after audit exhaustion."""
+    configurable = Configuration.from_runnable_config(config)
+    results, _, _ = _report_research_material(state, configurable)
+    topic = state["normalized_research_topic"]
+    overview = _deterministic_report_overview(results, topic)
+    sections = [
+        {
+            "dimension_id": result["dimension"]["id"],
+            "title": result["dimension"]["title"],
+            "content": _deterministic_report_section(result, topic),
+        }
+        for result in results
+    ]
+    conflicts = [
+        item for item in state.get("claim_conflicts", []) if item.get("material")
+    ]
+    if conflicts:
+        claims_by_id = _claim_index(results)
+        chinese = _uses_chinese(topic)
+        conflict_lines = []
+        for conflict in conflicts:
+            left = claims_by_id.get(conflict["left_claim_id"], {})
+            right = claims_by_id.get(conflict["right_claim_id"], {})
+            left_markers = " ".join(
+                f"[{source_id}]" for source_id in left.get("supporting_source_ids", [])
+            )
+            right_markers = " ".join(
+                f"[{source_id}]" for source_id in right.get("supporting_source_ids", [])
+            )
+            conflict_lines.append(
+                f"- {conflict['conflict_id']}: {left.get('claim', '')} {left_markers} / "
+                f"{right.get('claim', '')} {right_markers}. "
+                + (
+                    "现有合格证据存在冲突，无法安全地选择单一结论。"
+                    if chinese
+                    else "Accepted evidence conflicts; no single conclusion can be selected safely."
+                )
+            )
+        sections.append(
+            {
+                "dimension_id": "conflicts",
+                "title": "未解决的证据矛盾"
+                if chinese
+                else "Unresolved Evidence Conflicts",
+                "content": "\n".join(conflict_lines),
+            }
+        )
+    report = _assemble_sectioned_report(topic, overview, sections)
+    analysis_complete = state.get("consistency_analysis_complete", True)
+    consistency_audit = ReportConsistencyAudit(
+        passes=analysis_complete,
+        covered_conflict_ids=[
+            conflict["conflict_id"] for conflict in conflicts if analysis_complete
+        ],
+        omitted_conflict_ids=[],
+        issues=[]
+        if analysis_complete
+        else ["The pre-draft cross-claim consistency analysis was incomplete."],
+        revision_instructions=[]
+        if analysis_complete
+        else [
+            "Treat the fallback as an evidence inventory, not a reconciled synthesis."
+        ],
+    ).model_dump()
+    emit_research_event(
+        "safe_report_built",
+        research_run_id=state["research_run_id"],
+        section_count=len(sections),
+        material_conflict_count=len(conflicts),
+    )
+    return {
+        "report_draft": report,
+        "report_generation_mode": "safe_fallback",
+        "report_overview": overview,
+        "report_sections": sections,
+        "report_safe_fallback_used": True,
+        "report_consistency_audit": consistency_audit,
+    }
 
 
 def _bounded_report_part_revision(
@@ -2366,6 +2897,7 @@ def _revise_sectioned_report(
     research_topic = state["normalized_research_topic"]
     research_run_id = state["research_run_id"]
     audit_findings = json.dumps(state["report_audit"], ensure_ascii=False)
+    conflict_context = _format_conflict_ledger(state.get("claim_conflicts", []))
     results_by_id = {result["dimension"]["id"]: result for result in current_results}
     revised_sections = []
     for section in state.get("report_sections", []):
@@ -2386,6 +2918,11 @@ def _revise_sectioned_report(
             dimension_research=material,
             current_section=section.get("content", ""),
             audit_findings=audit_findings,
+        ) + (
+            "\n\nCross-claim conflict ledger:\n"
+            + conflict_context
+            + "\nPreserve both accepted-evidence sides and the conflict ID of each "
+            "unresolved material conflict."
         )
         revised_sections.append(
             {
@@ -2409,6 +2946,11 @@ def _revise_sectioned_report(
         dimension_research=overview_material,
         current_overview=current_overview,
         audit_findings=audit_findings,
+    ) + (
+        "\n\nCross-claim conflict ledger:\n"
+        + conflict_context
+        + "\nDo not silently select one side of an unresolved material conflict; "
+        "name its conflict ID when discussing it."
     )
     revised_overview = _bounded_report_part_revision(
         prompt=overview_prompt,
@@ -2440,7 +2982,7 @@ def revise_report(state: OverallState, config: RunnableConfig):
     """Revise only the issues identified by the independent audit."""
     configurable = Configuration.from_runnable_config(config)
     model = state.get("reasoning_model") or configurable.answer_model
-    current_results, _, _ = _current_research_material(state)
+    current_results, _, _ = _report_research_material(state, configurable)
     if state.get("report_generation_mode") == "sectioned" and state.get(
         "report_sections"
     ):
@@ -2453,6 +2995,11 @@ def revise_report(state: OverallState, config: RunnableConfig):
         dimension_research=material,
         draft_report=state["report_draft"],
         audit_findings=json.dumps(state["report_audit"], ensure_ascii=False),
+    ) + (
+        "\n\nCross-claim conflict ledger:\n"
+        + _format_conflict_ledger(state.get("claim_conflicts", []))
+        + "\nResolve or explicitly disclose every material conflict and name its "
+        "conflict ID."
     )
     try:
         result = create_deepseek_model(model).invoke(prompt)
@@ -2488,7 +3035,7 @@ def revise_report(state: OverallState, config: RunnableConfig):
 
 def finalize_answer(state: OverallState):
     """Render validated source markers from the audited report."""
-    current_results, sources, _ = _current_research_material(state)
+    current_results, sources, _ = _report_research_material(state)
     claim_ids = _audited_claim_source_ids(current_results)
     sources = [source for source in sources if source["source_id"] in claim_ids]
     emit_research_event("finalizing_answer", research_run_id=state["research_run_id"])
@@ -2503,9 +3050,12 @@ builder.add_node("request_topic_clarification", request_topic_clarification)
 builder.add_node("generate_research_dimensions", generate_research_dimensions)
 builder.add_node("review_research_dimensions", review_research_dimensions)
 builder.add_node("research_dimension", research_dimension)
+builder.add_node("prepare_report_evidence", prepare_report_evidence)
+builder.add_node("detect_claim_conflicts", detect_claim_conflicts)
 builder.add_node("draft_report", draft_report)
 builder.add_node("audit_report", audit_report)
 builder.add_node("revise_report", revise_report)
+builder.add_node("build_safe_report", build_safe_report)
 builder.add_node("finalize_answer", finalize_answer)
 builder.add_edge(START, "initialize_research_topic")
 builder.add_edge("initialize_research_topic", "analyze_research_topic")
@@ -2525,11 +3075,16 @@ builder.add_conditional_edges(
     route_dimension_review,
     ["generate_research_dimensions", "research_dimension"],
 )
-builder.add_edge("research_dimension", "draft_report")
+builder.add_edge("research_dimension", "prepare_report_evidence")
+builder.add_edge("prepare_report_evidence", "detect_claim_conflicts")
+builder.add_edge("detect_claim_conflicts", "draft_report")
 builder.add_edge("draft_report", "audit_report")
 builder.add_conditional_edges(
-    "audit_report", route_report_audit, ["revise_report", "finalize_answer"]
+    "audit_report",
+    route_report_audit,
+    ["revise_report", "build_safe_report", "finalize_answer"],
 )
 builder.add_edge("revise_report", "audit_report")
+builder.add_edge("build_safe_report", "finalize_answer")
 builder.add_edge("finalize_answer", END)
 graph = builder.compile(name="deepseek-tavily-multidimensional-research-agent")
