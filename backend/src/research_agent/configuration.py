@@ -144,10 +144,14 @@ class Configuration(BaseModel):
     )
 
     max_sources_per_domain: int = Field(
-        default=2,
+        default=1,
         ge=1,
         le=10,
-        description="Maximum retained sources from one domain per dimension.",
+        description=(
+            "Maximum retained sources from one publisher domain per dimension; "
+            "the diversity-first default prevents one institution from crowding "
+            "out independent evidence."
+        ),
     )
 
     source_acceptance_threshold: float = Field(

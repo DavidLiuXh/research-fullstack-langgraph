@@ -77,7 +77,24 @@ def test_deterministic_evaluator_scores_valid_evidence_and_trajectory():
                 "content": "A directly supported statement from the source.",
                 "is_primary_source": True,
                 "is_authoritative_source": True,
-            }
+                "source_type": "government",
+            },
+            {
+                "source_id": "S2",
+                "quality_status": "accepted",
+                "evidence_score": 0.9,
+                "domain": "academic.example",
+                "content": "Independent academic evidence.",
+                "source_type": "academic",
+            },
+            {
+                "source_id": "S3",
+                "quality_status": "accepted",
+                "evidence_score": 0.9,
+                "domain": "standards.example",
+                "content": "Independent standards evidence.",
+                "source_type": "standards_body",
+            },
         ],
         "dimension_results": [
             {
@@ -88,7 +105,15 @@ def test_deterministic_evaluator_scores_valid_evidence_and_trajectory():
                         "quality_status": "accepted",
                         "is_primary_source": True,
                         "is_authoritative_source": True,
-                    }
+                        "domain": "example.com",
+                        "source_type": "government",
+                    },
+                    {
+                        "source_id": "S2",
+                        "quality_status": "accepted",
+                        "domain": "academic.example",
+                        "source_type": "academic",
+                    },
                 ],
                 "known_gap_count": 1,
                 "resolved_gap_count": 1,
@@ -96,6 +121,11 @@ def test_deterministic_evaluator_scores_valid_evidence_and_trajectory():
                 "resolved_high_priority_gap_count": 1,
                 "high_priority_gap_source_coverage_count": 1,
                 "evidence_gain_history": [{"total_gain": 1}],
+                "direct_evidence_gap_count": 1,
+                "supported_claim_gap_count": 1,
+                "requested_type_gap_count": 1,
+                "independent_source_gap_count": 1,
+                "gap_assessment_failure_count": 0,
                 "completion_status": "sufficient",
                 "claims": [
                     {

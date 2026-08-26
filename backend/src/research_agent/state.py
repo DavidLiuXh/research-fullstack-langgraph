@@ -56,6 +56,7 @@ class EvidenceQuote(TypedDict):
 
 class EvidenceClaim(TypedDict):
     claim_id: NotRequired[str]
+    gap_ids: NotRequired[list[str]]
     claim: str
     supporting_source_ids: list[str]
     supporting_evidence: list[EvidenceQuote]
@@ -89,6 +90,12 @@ class DimensionResult(TypedDict):
     closed_gap_count: int
     unresolvable_gap_count: int
     gap_status_counts: dict[str, int]
+    direct_evidence_gap_count: int
+    supported_claim_gap_count: int
+    requested_type_gap_count: int
+    independent_source_gap_count: int
+    gap_assessment_failure_count: int
+    no_gain_loop_count: int
 
 
 class OverallState(TypedDict):
@@ -164,6 +171,7 @@ class DimensionState(TypedDict):
     completion_status: str
     claims: list[EvidenceClaim]
     dimension_summary: str
+    gap_assessment_failure_count: Annotated[int, operator.add]
 
 
 class DimensionInput(TypedDict):
@@ -192,3 +200,4 @@ class WebSearchState(TypedDict):
     gap_id: str
     requested_source_types: list[str]
     expected_evidence: str
+    exclude_domains: list[str]

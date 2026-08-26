@@ -357,6 +357,8 @@ def _operational_gap(gap: Mapping[str, Any], *, origin: str) -> dict[str, Any]:
             "supported_claims": [],
             "closure_reason": "",
             "remaining_evidence": "",
+            "closure_blockers": [],
+            "assessment_status": "not_assessed",
         }
     )
     return normalized
@@ -525,6 +527,53 @@ def generate_query(
     strategies = gap.get("search_strategy", [])
     do_not_repeat = gap.get("do_not_repeat", [])
     query_history = state.get("query_history", [])
+    accepted_sources = [
+        source
+        for source in state.get("selected_sources", [])
+        if source.get("quality_status") == "accepted"
+    ]
+    domain_counts: dict[str, int] = {}
+    for source in accepted_sources:
+        domain = str(source.get("domain", "")).strip()
+        if domain:
+            domain_counts[domain] = domain_counts.get(domain, 0) + 1
+    covered_domains = sorted(domain_counts)
+    accepted_by_id = {source["source_id"]: source for source in accepted_sources}
+    matched_domains = {
+        accepted_by_id[source_id].get("domain")
+        for source_id in gap.get("matched_source_ids", [])
+        if source_id in accepted_by_id and accepted_by_id[source_id].get("domain")
+    }
+    if gap.get("gap_id") == "quality-accepted-sources":
+        required_independent = configurable.min_accepted_sources_per_dimension
+    elif gap.get("priority") == "high":
+        required_independent = configurable.min_independent_sources_per_high_gap
+    else:
+        required_independent = 1
+    gap_domains_to_avoid = (
+        matched_domains if len(matched_domains) < required_independent else set()
+    )
+    saturated_domains = sorted(
+        {
+            *gap.get("excluded_domains", []),
+            *gap_domains_to_avoid,
+            *(
+                domain
+                for domain, count in domain_counts.items()
+                if count >= configurable.max_sources_per_domain
+            ),
+        }
+    )
+    covered_source_types = sorted(
+        {
+            str(source.get("source_type"))
+            for source in accepted_sources
+            if source.get("source_type") and source.get("source_type") != "unknown"
+        }
+    )
+    missing_source_types = sorted(
+        set(required_source_types) - set(covered_source_types)
+    )
     prompt = query_writer_instructions.format(
         current_date=get_current_date(),
         research_topic=state["research_topic"],
@@ -536,6 +585,10 @@ def generate_query(
         required_source_types=required_source_types or "No special requirement.",
         recommended_search_strategy=strategies or "No special strategy.",
         strategy_level=gap.get("strategy_level", 0),
+        covered_source_types=covered_source_types or "None.",
+        missing_source_types=missing_source_types or "None.",
+        covered_domains=covered_domains or "None.",
+        saturated_domains=saturated_domains or "None.",
         query_history=[*query_history, *do_not_repeat]
         or "None; this is the first pass.",
         number_queries=query_count,
@@ -599,6 +652,7 @@ def generate_query(
                 or _default_source_types(state["research_topic"], state["dimension"]),
                 "expected_evidence": gap.get("expected_evidence")
                 or gap.get("reason", ""),
+                "exclude_domains": saturated_domains,
             }
         )
     emit_research_event(
@@ -636,6 +690,7 @@ def dispatch_search_queries(state: QueryGenerationState):
                 "gap_id": task["gap_id"],
                 "requested_source_types": task["requested_source_types"],
                 "expected_evidence": task["expected_evidence"],
+                "exclude_domains": task.get("exclude_domains", []),
             },
         )
         for index, task in enumerate(state["search_tasks"])
@@ -665,6 +720,7 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> DimensionStat
                 include_answer=False,
                 include_raw_content=False,
                 include_usage=True,
+                exclude_domains=state.get("exclude_domains", []) or None,
             )
             break
         except Exception as error:  # Tavily exposes multiple transport exceptions.
@@ -929,24 +985,120 @@ def assess_gap_evidence(state: DimensionState, config: RunnableConfig):
     gap = dict(state.get("active_gap") or {})
     if not gap:
         raise ValueError("Cannot assess evidence without an active gap")
-    accepted = [
+    all_accepted = [
         source
         for source in state.get("selected_sources", [])
         if source.get("quality_status") == "accepted"
     ]
-    if accepted:
+    prior_source_ids = set(gap.get("matched_source_ids", []))
+    has_provenance = any(
+        source.get("gap_id") or source.get("gap_ids") for source in all_accepted
+    )
+    accepted = [
+        source
+        for source in all_accepted
+        if not has_provenance
+        or source["source_id"] in prior_source_ids
+        or gap["gap_id"] == source.get("gap_id")
+        or gap["gap_id"] in source.get("gap_ids", [])
+    ]
+    assessment_status = "completed"
+    assessment_failure_count = 0
+    if gap["gap_id"] in {
+        "quality-accepted-sources",
+        "quality-authoritative-source",
+        "quality-primary-source",
+    }:
+        if gap["gap_id"] == "quality-authoritative-source":
+            accepted = [
+                source
+                for source in all_accepted
+                if source.get("is_authoritative_source")
+            ]
+        elif gap["gap_id"] == "quality-primary-source":
+            accepted = [
+                source for source in all_accepted if source.get("is_primary_source")
+            ]
+        else:
+            accepted = all_accepted
+        result = GapEvidenceAssessment(
+            gap_id=gap["gap_id"],
+            directly_answers_gap=bool(accepted),
+            matched_source_ids=[source["source_id"] for source in accepted],
+            supported_claims=[
+                f"The dimension has {len(accepted)} qualifying accepted source(s)."
+            ]
+            if accepted
+            else [],
+            remaining_evidence="" if accepted else gap.get("expected_evidence", ""),
+        )
+        assessment_status = "deterministic_quality_check"
+    elif accepted:
         prompt = gap_evidence_assessment_instructions.format(
             research_topic=state["research_topic"],
             dimension_title=state["dimension"]["title"],
             active_gap=json.dumps(gap, ensure_ascii=False),
+            output_schema=json.dumps(
+                ClaimExtraction.model_json_schema(), ensure_ascii=False
+            ),
             accepted_evidence=format_sources_for_research(accepted),
         )
-        try:
-            result = (
-                create_deepseek_model(configurable.reflection_model)
-                .with_structured_output(GapEvidenceAssessment, method="json_mode")
-                .invoke(prompt)
+        structured_model = create_deepseek_model(
+            configurable.reflection_model
+        ).with_structured_output(ClaimExtraction, method="json_mode")
+        candidate_by_id = {source["source_id"]: source for source in accepted}
+
+        def invoke_assessment(retry: bool = False):
+            retry_instruction = (
+                "\nThe previous response was invalid. Return only claims with exact "
+                f"verbatim quotes that directly answer gap_id {gap['gap_id']}."
+                if retry
+                else ""
             )
+            assessment_result = structured_model.invoke(prompt + retry_instruction)
+            if not isinstance(assessment_result, ClaimExtraction):
+                raise TypeError("Gap evidence assessment returned an unexpected type")
+            matched_source_ids = []
+            contradictory_source_ids = []
+            supported_claims = []
+            for claim in assessment_result.claims[:6]:
+                if claim.gap_ids and gap["gap_id"] not in claim.gap_ids:
+                    continue
+                verified_supporting_ids = []
+                for evidence in claim.evidence:
+                    source = candidate_by_id.get(evidence.source_id)
+                    if source and locate_evidence_quote(
+                        source.get("content", ""),
+                        evidence.quote,
+                        min_chars=configurable.min_evidence_quote_chars,
+                    ):
+                        verified_supporting_ids.append(evidence.source_id)
+                if not verified_supporting_ids:
+                    continue
+                matched_source_ids.extend(verified_supporting_ids)
+                supported_claims.append(claim.claim)
+                for evidence in claim.counter_evidence:
+                    source = candidate_by_id.get(evidence.source_id)
+                    if source and locate_evidence_quote(
+                        source.get("content", ""),
+                        evidence.quote,
+                        min_chars=configurable.min_evidence_quote_chars,
+                    ):
+                        contradictory_source_ids.append(evidence.source_id)
+            matched_source_ids = list(dict.fromkeys(matched_source_ids))
+            return GapEvidenceAssessment(
+                gap_id=gap["gap_id"],
+                directly_answers_gap=bool(matched_source_ids),
+                matched_source_ids=matched_source_ids,
+                supported_claims=list(dict.fromkeys(supported_claims)),
+                contradictory_source_ids=list(dict.fromkeys(contradictory_source_ids)),
+                remaining_evidence=(
+                    "" if matched_source_ids else assessment_result.summary
+                ),
+            )
+
+        try:
+            result = invoke_assessment()
         except (
             AttributeError,
             LengthFinishReasonError,
@@ -954,22 +1106,35 @@ def assess_gap_evidence(state: DimensionState, config: RunnableConfig):
             TypeError,
             ValueError,
         ) as error:
-            emit_research_event(
-                "gap_evidence_assessment_fallback",
-                research_run_id=state["research_run_id"],
-                dimension=state["dimension"],
-                gap_id=gap["gap_id"],
-                error=str(error),
-            )
-            result = GapEvidenceAssessment(
-                gap_id=gap["gap_id"],
-                remaining_evidence=gap.get("expected_evidence", ""),
-            )
+            try:
+                result = invoke_assessment(retry=True)
+                assessment_status = "completed_after_retry"
+            except (
+                AttributeError,
+                LengthFinishReasonError,
+                OutputParserException,
+                TypeError,
+                ValueError,
+            ) as retry_error:
+                emit_research_event(
+                    "gap_evidence_assessment_fallback",
+                    research_run_id=state["research_run_id"],
+                    dimension=state["dimension"],
+                    gap_id=gap["gap_id"],
+                    error=f"{type(error).__name__}: {error}; retry: {retry_error}",
+                )
+                result = GapEvidenceAssessment(
+                    gap_id=gap["gap_id"],
+                    remaining_evidence=gap.get("expected_evidence", ""),
+                )
+                assessment_status = "structured_output_failure"
+                assessment_failure_count = 1
     else:
         result = GapEvidenceAssessment(
             gap_id=gap["gap_id"],
             remaining_evidence=gap.get("expected_evidence", ""),
         )
+        assessment_status = "no_gap_candidate_evidence"
 
     accepted_by_id = {source["source_id"]: source for source in accepted}
     matched_ids = list(
@@ -989,8 +1154,6 @@ def assess_gap_evidence(state: DimensionState, config: RunnableConfig):
     directly_answers = bool(result.directly_answers_gap and matched_ids)
     if not directly_answers:
         matched_ids = []
-
-    prior_source_ids = set(gap.get("matched_source_ids", []))
     new_source_ids = [item for item in matched_ids if item not in prior_source_ids]
     prior_claims = {
         re.sub(r"\s+", " ", claim).strip().casefold()
@@ -1001,6 +1164,8 @@ def assess_gap_evidence(state: DimensionState, config: RunnableConfig):
             claim.strip() for claim in result.supported_claims if claim.strip()
         )
     )
+    if not directly_answers:
+        supported_claims = []
     new_claims = [
         claim
         for claim in supported_claims
@@ -1028,7 +1193,9 @@ def assess_gap_evidence(state: DimensionState, config: RunnableConfig):
         if matched_sources
         else 0.0
     )
-    has_progress = bool(directly_answers and (new_source_ids or new_claims))
+    # New evidence, rather than a differently worded model claim over evidence
+    # already seen, is the reliable signal for another search pass.
+    has_progress = bool(directly_answers and new_source_ids)
     assessment = {
         **result.model_dump(),
         "gap_id": gap["gap_id"],
@@ -1042,6 +1209,8 @@ def assess_gap_evidence(state: DimensionState, config: RunnableConfig):
         "independent_source_count": len(independent_domains),
         "evidence_strength": evidence_strength,
         "has_progress": has_progress,
+        "assessment_status": assessment_status,
+        "candidate_source_count": len(accepted),
     }
     emit_research_event(
         "gap_evidence_assessed",
@@ -1049,7 +1218,81 @@ def assess_gap_evidence(state: DimensionState, config: RunnableConfig):
         dimension=state["dimension"],
         assessment=assessment,
     )
-    return {"gap_evidence_assessment": assessment}
+    return {
+        "gap_evidence_assessment": assessment,
+        "gap_assessment_failure_count": assessment_failure_count,
+    }
+
+
+def _gap_closure_snapshot(
+    gap: dict,
+    *,
+    matched_ids: list[str],
+    supported_claims: list[str],
+    contradictory_ids: list[str],
+    selected_by_id: dict[str, dict],
+    configurable: Configuration,
+    direct_evidence_confirmed: bool,
+) -> dict[str, Any]:
+    """Calculate deterministic gap closure requirements from cumulative evidence."""
+    matched_sources = [
+        selected_by_id[source_id]
+        for source_id in matched_ids
+        if source_id in selected_by_id
+    ]
+    required_types = set(gap.get("required_source_types", []))
+    requested_type_satisfied = bool(
+        matched_sources
+        and (
+            not required_types
+            or any(
+                source.get("source_type") in required_types
+                for source in matched_sources
+            )
+        )
+    )
+    independent_domains = {
+        source.get("domain") or source.get("canonical_url") or source.get("url")
+        for source in matched_sources
+    }
+    gap_id = gap["gap_id"]
+    if gap_id == "quality-primary-source":
+        requested_type_satisfied = any(
+            bool(source.get("is_primary_source")) for source in matched_sources
+        )
+        required_independent = 1
+    elif gap_id == "quality-authoritative-source":
+        requested_type_satisfied = any(
+            bool(source.get("is_authoritative_source")) for source in matched_sources
+        )
+        required_independent = 1
+    elif gap_id == "quality-accepted-sources":
+        required_independent = configurable.min_accepted_sources_per_dimension
+    else:
+        required_independent = (
+            configurable.min_independent_sources_per_high_gap
+            if gap.get("priority") == "high"
+            else 1
+        )
+    closure_blockers = []
+    if not direct_evidence_confirmed:
+        closure_blockers.append("missing_direct_evidence")
+    if not supported_claims:
+        closure_blockers.append("missing_supported_claim")
+    if not requested_type_satisfied:
+        closure_blockers.append("missing_requested_source_type")
+    if len(independent_domains) < required_independent:
+        closure_blockers.append("insufficient_independent_sources")
+    if contradictory_ids:
+        closure_blockers.append("unresolved_contradiction")
+    return {
+        "matched_sources": matched_sources,
+        "requested_type_satisfied": requested_type_satisfied,
+        "independent_domains": independent_domains,
+        "required_independent": required_independent,
+        "direct_evidence_confirmed": direct_evidence_confirmed,
+        "closure_blockers": closure_blockers,
+    }
 
 
 def update_gap_status(state: DimensionState, config: RunnableConfig):
@@ -1085,60 +1328,34 @@ def update_gap_status(state: DimensionState, config: RunnableConfig):
             ]
         )
     )
+    # Every assessment sees the complete provenance-constrained evidence set for
+    # this gap, so the latest result supersedes earlier contradiction candidates.
     contradictory_ids = list(
         dict.fromkeys(assessment.get("contradictory_source_ids", []))
     )
-    matched_sources = [
-        selected_by_id[source_id]
-        for source_id in matched_ids
-        if source_id in selected_by_id
-    ]
-    required_types = set(gap.get("required_source_types", []))
-    requested_type_satisfied = bool(
-        matched_sources
-        and (
-            not required_types
-            or any(
-                source.get("source_type") in required_types
-                for source in matched_sources
-            )
-        )
+    snapshot = _gap_closure_snapshot(
+        gap,
+        matched_ids=matched_ids,
+        supported_claims=supported_claims,
+        contradictory_ids=contradictory_ids,
+        selected_by_id=selected_by_id,
+        configurable=configurable,
+        direct_evidence_confirmed=bool(
+            gap.get("direct_evidence_confirmed")
+            or assessment.get("directly_answers_gap")
+        ),
     )
-    independent_domains = {
-        source.get("domain") or source.get("canonical_url") or source.get("url")
-        for source in matched_sources
-    }
-    if gap_id == "quality-primary-source":
-        requested_type_satisfied = any(
-            bool(source.get("is_primary_source")) for source in matched_sources
-        )
-        required_independent = 1
-    elif gap_id == "quality-authoritative-source":
-        requested_type_satisfied = any(
-            bool(source.get("is_authoritative_source")) for source in matched_sources
-        )
-        required_independent = 1
-    elif gap_id == "quality-accepted-sources":
-        required_independent = configurable.min_accepted_sources_per_dimension
-    else:
-        required_independent = (
-            configurable.min_independent_sources_per_high_gap
-            if gap.get("priority") == "high"
-            else 1
-        )
-    direct_evidence_confirmed = bool(
-        gap.get("direct_evidence_confirmed") or assessment.get("directly_answers_gap")
-    )
-    has_progress = bool(assessment.get("has_progress"))
+    requested_type_satisfied = snapshot["requested_type_satisfied"]
+    independent_domains = snapshot["independent_domains"]
+    required_independent = snapshot["required_independent"]
+    direct_evidence_confirmed = snapshot["direct_evidence_confirmed"]
+    closure_blockers = snapshot["closure_blockers"]
+    prior_blockers = set(gap.get("closure_blockers", []))
+    blockers_resolved = sorted(prior_blockers - set(closure_blockers))
+    has_progress = bool(assessment.get("has_progress") or blockers_resolved)
     attempt_count = int(gap.get("attempt_count", 0)) + 1
     no_progress_count = 0 if has_progress else int(gap.get("no_progress_count", 0)) + 1
-    can_close = bool(
-        direct_evidence_confirmed
-        and supported_claims
-        and requested_type_satisfied
-        and len(independent_domains) >= required_independent
-        and not contradictory_ids
-    )
+    can_close = bool(not closure_blockers)
 
     if can_close:
         status = "closed"
@@ -1146,6 +1363,13 @@ def update_gap_status(state: DimensionState, config: RunnableConfig):
         closure_reason = (
             f"Direct accepted evidence from {len(independent_domains)} independent "
             "source domain(s) satisfied the gap requirements."
+        )
+    elif assessment.get("assessment_status") == "structured_output_failure":
+        status = "unresolvable"
+        gap_route = "unresolvable"
+        closure_reason = (
+            "Gap evidence could not be assessed after the bounded structured-output "
+            "retry; repeating the same web search would not repair the assessment."
         )
     elif (
         attempt_count >= state["max_research_loops"]
@@ -1179,6 +1403,9 @@ def update_gap_status(state: DimensionState, config: RunnableConfig):
             "independent_source_count": len(independent_domains),
             "closure_reason": closure_reason,
             "remaining_evidence": assessment.get("remaining_evidence", ""),
+            "closure_blockers": closure_blockers,
+            "required_independent_source_count": required_independent,
+            "assessment_status": assessment.get("assessment_status", "unknown"),
         }
     )
     registry[gap_id] = gap
@@ -1190,18 +1417,25 @@ def update_gap_status(state: DimensionState, config: RunnableConfig):
     coverage_ids = set(state.get("gap_source_coverage_ids", []))
     if direct_evidence_confirmed and requested_type_satisfied:
         coverage_ids.add(gap_id)
+    new_source_count = len(assessment.get("new_matched_source_ids", []))
     gain = {
         "loop": state.get("research_loop_count", 0) + 1,
         "gap_id": gap_id,
-        "new_source_count": len(assessment.get("new_matched_source_ids", [])),
-        "new_accepted_source_count": len(assessment.get("new_matched_source_ids", [])),
-        "new_supported_claim_count": len(assessment.get("new_supported_claims", [])),
+        "new_source_count": new_source_count,
+        "new_accepted_source_count": new_source_count,
+        # A paraphrase of an earlier LLM claim is not independent evidence gain.
+        # Claim-only progress is represented by a resolved closure blocker below.
+        "new_supported_claim_count": (
+            len(assessment.get("new_supported_claims", [])) if new_source_count else 0
+        ),
         "resolved_gap_count": int(status == "closed"),
+        "resolved_blocker_count": len(blockers_resolved),
     }
     gain["total_gain"] = (
         gain["new_accepted_source_count"]
         + gain["new_supported_claim_count"]
         + gain["resolved_gap_count"]
+        + gain["resolved_blocker_count"]
     )
     emit_research_event(
         "gap_status_updated",
@@ -1210,6 +1444,7 @@ def update_gap_status(state: DimensionState, config: RunnableConfig):
         gap=gap,
         route=gap_route,
         evidence_gain=gain,
+        closure_blockers=closure_blockers,
     )
     return {
         "gap_registry": registry,
@@ -1234,24 +1469,56 @@ def route_gap_progress(state: DimensionState):
 
 def replan_search(state: DimensionState, config: RunnableConfig):
     """Escalate the active gap's search strategy after a no-progress pass."""
-    del config
+    configurable = Configuration.from_runnable_config(config)
     registry = {
         key: dict(value) for key, value in state.get("gap_registry", {}).items()
     }
     gap_id = state.get("active_gap_id", "")
     gap = dict(registry[gap_id])
     level = int(gap.get("strategy_level", 0)) + 1
-    strategies = {
+    blockers = gap.get("closure_blockers", [])
+    blocker_guidance = {
+        "missing_direct_evidence": "Search the exact expected fact, metric, date, unit, or quoted statement instead of broad topic coverage.",
+        "missing_supported_claim": "Target documents containing extractable factual statements and data, not landing pages or summaries.",
+        "missing_requested_source_type": "Target the still-missing requested source type and name likely official institutions explicitly.",
+        "insufficient_independent_sources": "Exclude already saturated publisher domains and find an independent organization confirming the evidence.",
+        "unresolved_contradiction": "Search primary documents that define scope, date, unit, and methodology needed to reconcile the contradiction.",
+    }
+    generic_strategies = {
         1: "Target named authoritative institutions and restrict queries to their domains.",
         2: "Search for the original document, dataset, publication title, author, and date.",
         3: "Split the evidence requirement into narrower factual subquestions and use source-specific terminology.",
     }
-    guidance = strategies.get(
-        level,
-        "Use exact phrases, multilingual terminology, and archival or bibliographic discovery queries.",
+    guidance_parts = [
+        blocker_guidance[blocker] for blocker in blockers if blocker in blocker_guidance
+    ]
+    if not guidance_parts:
+        guidance_parts = [
+            generic_strategies.get(
+                level,
+                "Use exact phrases, multilingual terminology, and archival or bibliographic discovery queries.",
+            )
+        ]
+    domain_counts: dict[str, int] = {}
+    for source in state.get("selected_sources", []):
+        if source.get("quality_status") != "accepted":
+            continue
+        domain = str(source.get("domain", "")).strip()
+        if domain:
+            domain_counts[domain] = domain_counts.get(domain, 0) + 1
+    saturated_domains = sorted(
+        domain
+        for domain, count in domain_counts.items()
+        if count >= configurable.max_sources_per_domain
     )
+    if saturated_domains:
+        guidance_parts.append(
+            "Do not target these saturated domains: " + ", ".join(saturated_domains)
+        )
+    guidance = " ".join(dict.fromkeys(guidance_parts))
     gap["strategy_level"] = level
     gap["search_strategy"] = [guidance]
+    gap["excluded_domains"] = saturated_domains
     gap["status"] = "active"
     registry[gap_id] = gap
     emit_research_event(
@@ -1626,6 +1893,96 @@ def merge_gap_registry(state: DimensionState):
     }
 
 
+def _reconcile_extracted_claims(
+    state: DimensionState,
+    claims: list[dict],
+    configurable: Configuration,
+) -> dict[str, Any]:
+    """Backfill verified claim evidence into its provenance-constrained gaps."""
+    registry = {
+        key: dict(value) for key, value in state.get("gap_registry", {}).items()
+    }
+    selected_by_id = {
+        source["source_id"]: source
+        for source in state.get("selected_sources", [])
+        if source.get("quality_status") == "accepted"
+    }
+    resolved_ids = set(state.get("resolved_gap_ids", []))
+    coverage_ids = set(state.get("gap_source_coverage_ids", []))
+    reconciled_claim_count = 0
+    for claim in claims:
+        supporting_ids = claim.get("supporting_source_ids", [])
+        for gap_id in claim.get("gap_ids", []):
+            gap = registry.get(gap_id)
+            if gap is None:
+                continue
+            provenance_ids = [
+                source_id
+                for source_id in supporting_ids
+                if source_id in selected_by_id
+                and (
+                    gap_id == selected_by_id[source_id].get("gap_id")
+                    or gap_id in selected_by_id[source_id].get("gap_ids", [])
+                )
+            ]
+            if not provenance_ids:
+                continue
+            matched_ids = list(
+                dict.fromkeys([*gap.get("matched_source_ids", []), *provenance_ids])
+            )
+            supported_claims = list(
+                dict.fromkeys([*gap.get("supported_claims", []), claim["claim"]])
+            )
+            contradictory_ids = list(
+                dict.fromkeys(gap.get("contradictory_source_ids", []))
+            )
+            snapshot = _gap_closure_snapshot(
+                gap,
+                matched_ids=matched_ids,
+                supported_claims=supported_claims,
+                contradictory_ids=contradictory_ids,
+                selected_by_id=selected_by_id,
+                configurable=configurable,
+                direct_evidence_confirmed=True,
+            )
+            gap.update(
+                {
+                    "matched_source_ids": matched_ids,
+                    "supported_claims": supported_claims,
+                    "direct_evidence_confirmed": True,
+                    "requested_source_type_satisfied": snapshot[
+                        "requested_type_satisfied"
+                    ],
+                    "independent_source_count": len(snapshot["independent_domains"]),
+                    "required_independent_source_count": snapshot[
+                        "required_independent"
+                    ],
+                    "closure_blockers": snapshot["closure_blockers"],
+                    "assessment_status": "claim_reconciled",
+                }
+            )
+            if not snapshot["closure_blockers"]:
+                gap["status"] = "closed"
+                gap["closure_reason"] = (
+                    "Verified extracted claims and provenance-constrained accepted "
+                    "evidence satisfied every closure requirement."
+                )
+                resolved_ids.add(gap_id)
+            if (
+                snapshot["direct_evidence_confirmed"]
+                and snapshot["requested_type_satisfied"]
+            ):
+                coverage_ids.add(gap_id)
+            registry[gap_id] = gap
+            reconciled_claim_count += 1
+    return {
+        "gap_registry": registry,
+        "resolved_gap_ids": sorted(resolved_ids),
+        "gap_source_coverage_ids": sorted(coverage_ids),
+        "claim_reconciled_count": reconciled_claim_count,
+    }
+
+
 def extract_claims(state: DimensionState, config: RunnableConfig):
     """Convert selected evidence into an auditable claim set."""
     configurable = Configuration.from_runnable_config(config)
@@ -1659,6 +2016,7 @@ def extract_claims(state: DimensionState, config: RunnableConfig):
             reflection_assessment=json.dumps(
                 state.get("reflection_assessment", {}), ensure_ascii=False
             ),
+            gap_registry=json.dumps(state.get("gap_registry", {}), ensure_ascii=False),
             selected_evidence=format_sources_for_research(
                 sources, max_content_chars=content_chars
             ),
@@ -1716,6 +2074,7 @@ def extract_claims(state: DimensionState, config: RunnableConfig):
                 "dimension_summary": "No claim passed structured evidence extraction.",
             }
     source_by_id = {source["source_id"]: source for source in selected}
+    valid_gap_ids = set(state.get("gap_registry", {}))
 
     def validate_extraction(extraction):
         validated_claims = []
@@ -1750,9 +2109,22 @@ def extract_claims(state: DimensionState, config: RunnableConfig):
             supporting_evidence, contradicting_evidence = evidence_groups
             if not supporting_evidence:
                 continue
+            supporting_ids = {item["source_id"] for item in supporting_evidence}
+            mapped_gap_ids = []
+            for gap_id in claim.gap_ids:
+                if gap_id not in valid_gap_ids:
+                    continue
+                if any(
+                    gap_id == source_by_id[source_id].get("gap_id")
+                    or gap_id in source_by_id[source_id].get("gap_ids", [])
+                    for source_id in supporting_ids
+                    if source_id in source_by_id
+                ):
+                    mapped_gap_ids.append(gap_id)
             validated_claims.append(
                 {
                     "claim": claim.claim,
+                    "gap_ids": list(dict.fromkeys(mapped_gap_ids)),
                     "supporting_source_ids": list(
                         dict.fromkeys(item["source_id"] for item in supporting_evidence)
                     ),
@@ -1803,7 +2175,21 @@ def extract_claims(state: DimensionState, config: RunnableConfig):
         claim_count=len(claims),
         invalid_evidence_count=invalid_evidence_count,
     )
-    return {"claims": claims, "dimension_summary": dimension_summary}
+    reconciliation = _reconcile_extracted_claims(state, claims, configurable)
+    emit_research_event(
+        "claims_reconciled_to_gaps",
+        research_run_id=state["research_run_id"],
+        dimension=state["dimension"],
+        reconciled_claim_count=reconciliation["claim_reconciled_count"],
+        resolved_gap_count=len(reconciliation["resolved_gap_ids"]),
+    )
+    return {
+        "claims": claims,
+        "dimension_summary": dimension_summary,
+        "gap_registry": reconciliation["gap_registry"],
+        "resolved_gap_ids": reconciliation["resolved_gap_ids"],
+        "gap_source_coverage_ids": reconciliation["gap_source_coverage_ids"],
+    }
 
 
 dimension_builder = StateGraph(DimensionState, input_schema=DimensionInput)
@@ -1911,6 +2297,28 @@ def research_dimension(state: DimensionInput, config: RunnableConfig):
         "closed_gap_count": status_counts.get("closed", 0),
         "unresolvable_gap_count": status_counts.get("unresolvable", 0),
         "gap_status_counts": status_counts,
+        "direct_evidence_gap_count": sum(
+            bool(gap.get("direct_evidence_confirmed")) for gap in gap_registry.values()
+        ),
+        "supported_claim_gap_count": sum(
+            bool(gap.get("supported_claims")) for gap in gap_registry.values()
+        ),
+        "requested_type_gap_count": sum(
+            bool(gap.get("requested_source_type_satisfied"))
+            for gap in gap_registry.values()
+        ),
+        "independent_source_gap_count": sum(
+            int(gap.get("independent_source_count", 0))
+            >= int(gap.get("required_independent_source_count", 1))
+            for gap in gap_registry.values()
+        ),
+        "gap_assessment_failure_count": int(
+            result.get("gap_assessment_failure_count", 0)
+        ),
+        "no_gain_loop_count": sum(
+            int(gain.get("total_gain", 0)) <= 0
+            for gain in result.get("evidence_gain_history", [])
+        ),
     }
     emit_research_event(
         "dimension_completed",

@@ -132,11 +132,20 @@ def format_sources_for_research(
                 f"Quality: {source['quality_status']}\n"
                 f"Evidence score: {source.get('evidence_score', 0):.2f}\n"
             )
+        gap_ids = list(
+            dict.fromkeys(
+                [
+                    *source.get("gap_ids", []),
+                    *([source["gap_id"]] if source.get("gap_id") else []),
+                ]
+            )
+        )
+        provenance = f"Gap provenance: {', '.join(gap_ids)}\n" if gap_ids else ""
         blocks.append(
             f"[{source['source_id']}]\n"
             f"Title: {source['title']}\n"
             f"URL: {source['url']}\n"
-            f"{metadata}{quality_metadata}Content: {content}"
+            f"{metadata}{quality_metadata}{provenance}Content: {content}"
         )
     return "\n\n".join(blocks)
 

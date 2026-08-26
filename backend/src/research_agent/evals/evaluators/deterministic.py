@@ -67,6 +67,20 @@ def evaluate_deterministic_quality(
         source for source in selected if source.get("evidence_score") is not None
     ]
     domains = {source.get("domain") for source in selected if source.get("domain")}
+    source_types = {
+        source.get("source_type")
+        for source in selected
+        if source.get("source_type") and source.get("source_type") != "unknown"
+    }
+    research_sources = outputs.get("sources", [])
+    research_selected = [
+        source
+        for source in research_sources
+        if source.get("quality_status") == "accepted"
+    ]
+    research_domains = {
+        source.get("domain") for source in research_selected if source.get("domain")
+    }
     sufficient_dimensions = [
         result for result in dimensions if result.get("is_sufficient")
     ]
@@ -118,6 +132,21 @@ def evaluate_deterministic_quality(
         for gain in result.get("evidence_gain_history", [])
     ]
     gainful_loops = [gain for gain in gain_history if gain.get("total_gain", 0) > 0]
+    direct_evidence_gap_count = sum(
+        int(result.get("direct_evidence_gap_count", 0)) for result in dimensions
+    )
+    supported_claim_gap_count = sum(
+        int(result.get("supported_claim_gap_count", 0)) for result in dimensions
+    )
+    requested_type_gap_count = sum(
+        int(result.get("requested_type_gap_count", 0)) for result in dimensions
+    )
+    independent_source_gap_count = sum(
+        int(result.get("independent_source_gap_count", 0)) for result in dimensions
+    )
+    gap_assessment_failure_count = sum(
+        int(result.get("gap_assessment_failure_count", 0)) for result in dimensions
+    )
     available_dimensions = [
         result
         for result in dimensions
@@ -140,6 +169,18 @@ def evaluate_deterministic_quality(
             and source.get("is_authoritative_source")
             for source in result.get("sources", [])
         )
+    ]
+    dimensions_with_independent_publishers = [
+        result
+        for result in dimensions
+        if len(
+            {
+                source.get("domain")
+                for source in result.get("sources", [])
+                if source.get("quality_status") == "accepted" and source.get("domain")
+            }
+        )
+        >= 2
     ]
 
     event_types = {
@@ -240,6 +281,26 @@ def evaluate_deterministic_quality(
         _score(
             "source_domain_diversity",
             _ratio(len(domains), len(selected), empty=0.0),
+            f"{len(domains)} unique report-evidence domains across {len(selected)} selected sources.",
+        ),
+        _score(
+            "research_source_domain_diversity",
+            _ratio(len(research_domains), len(research_selected), empty=0.0),
+            f"{len(research_domains)} unique accepted research domains across {len(research_selected)} sources.",
+        ),
+        _score(
+            "source_type_diversity",
+            _ratio(len(source_types), min(len(selected), 3), empty=0.0),
+            f"{len(source_types)} distinct recognized source types in report evidence; target=3.",
+        ),
+        _score(
+            "independent_publisher_dimension_coverage",
+            _ratio(
+                len(dimensions_with_independent_publishers),
+                len(dimensions),
+                empty=0.0,
+            ),
+            f"{len(dimensions_with_independent_publishers)}/{len(dimensions)} dimensions have at least two accepted publisher domains.",
         ),
         _score(
             "primary_source_dimension_coverage",
@@ -253,6 +314,36 @@ def evaluate_deterministic_quality(
             "gap_resolution",
             _ratio(resolved_gap_count, known_gap_count, empty=1.0),
             f"{resolved_gap_count}/{known_gap_count} known gaps resolved.",
+        ),
+        _score(
+            "gap_direct_evidence_coverage",
+            _ratio(direct_evidence_gap_count, known_gap_count, empty=1.0),
+            f"{direct_evidence_gap_count}/{known_gap_count} gaps have direct accepted evidence.",
+        ),
+        _score(
+            "gap_supported_claim_coverage",
+            _ratio(supported_claim_gap_count, known_gap_count, empty=1.0),
+            f"{supported_claim_gap_count}/{known_gap_count} gaps have supported claims.",
+        ),
+        _score(
+            "gap_requested_type_coverage",
+            _ratio(requested_type_gap_count, known_gap_count, empty=1.0),
+            f"{requested_type_gap_count}/{known_gap_count} gaps satisfy their requested source type.",
+        ),
+        _score(
+            "gap_independent_source_coverage",
+            _ratio(independent_source_gap_count, known_gap_count, empty=1.0),
+            f"{independent_source_gap_count}/{known_gap_count} gaps meet their independent-source requirement.",
+        ),
+        _score(
+            "gap_assessment_reliability",
+            1
+            - _ratio(
+                gap_assessment_failure_count,
+                len(gain_history),
+                empty=0.0,
+            ),
+            f"{gap_assessment_failure_count}/{len(gain_history)} gap assessments used conservative structured-output fallback.",
         ),
         _score(
             "high_priority_gap_resolution",
