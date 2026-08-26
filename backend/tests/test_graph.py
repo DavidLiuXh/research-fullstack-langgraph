@@ -208,14 +208,43 @@ def test_generated_queries_are_bound_only_to_the_active_gap(monkeypatch):
             "gap_id": "gap-primary",
             "requested_source_types": ["government"],
             "expected_evidence": "Official data",
+            "exclude_domains": [],
         },
         {
             "query": "academic comparison",
             "gap_id": "gap-primary",
             "requested_source_types": ["government"],
             "expected_evidence": "Official data",
+            "exclude_domains": [],
         },
     ]
+
+
+def test_query_generation_excludes_saturated_domains_on_first_pass(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class FakeQueryModel:
+        def with_structured_output(self, schema, method):
+            return self
+
+        def invoke(self, prompt):
+            assert "repeat.gov" in prompt
+            return SearchQueryList(query=["independent official evidence"])
+
+    monkeypatch.setattr(
+        graph_module, "create_deepseek_model", lambda *a, **k: FakeQueryModel()
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    gap = _gap_record(status="active", strategy_level=0, matched_source_ids=["S1"])
+    result = generate_query(
+        _dimension_state(
+            active_gap=gap,
+            selected_sources=[_accepted_source("S1", "repeat.gov")],
+        ),
+        {"configurable": {"max_sources_per_domain": 2}},
+    )
+
+    assert result["search_tasks"][0]["exclude_domains"] == ["repeat.gov"]
 
 
 def test_query_generation_failure_uses_a_new_gap_specific_fallback(monkeypatch):
@@ -402,16 +431,12 @@ def test_gap_evidence_assessment_does_not_count_topic_only_source_as_gain(monkey
 
     class FakeModel:
         def with_structured_output(self, schema, method):
-            assert schema is GapEvidenceAssessment
+            assert schema is ClaimExtraction
             return self
 
         def invoke(self, prompt):
-            return GapEvidenceAssessment(
-                gap_id="gap-one",
-                directly_answers_gap=False,
-                matched_source_ids=["S1"],
-                supported_claims=[],
-                remaining_evidence="The official figure is still missing.",
+            return ClaimExtraction(
+                claims=[], summary="The official figure is still missing."
             )
 
     monkeypatch.setattr(
@@ -446,16 +471,106 @@ def test_gap_evidence_parser_failure_is_conservatively_no_progress(monkeypatch):
     )
     monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
     gap = _gap_record(status="active")
-    result = assess_gap_evidence(
+    response = assess_gap_evidence(
+        _dimension_state(
+            active_gap=gap, selected_sources=[_accepted_source("S1", "one.gov")]
+        ),
+        {},
+    )
+    result = response["gap_evidence_assessment"]
+
+    assert result["directly_answers_gap"] is False
+    assert result["has_progress"] is False
+    assert result["remaining_evidence"] == gap["expected_evidence"]
+    assert result["assessment_status"] == "structured_output_failure"
+    assert response["gap_assessment_failure_count"] == 1
+
+
+def test_gap_evidence_assessment_retries_and_limits_candidates_by_provenance(
+    monkeypatch,
+):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class RetryingModel:
+        calls = 0
+
+        def with_structured_output(self, schema, method):
+            assert schema is ClaimExtraction
+            return self
+
+        def invoke(self, prompt):
+            self.calls += 1
+            assert "IN-SCOPE DIRECT EVIDENCE" in prompt
+            assert "OUT-OF-SCOPE" not in prompt
+            if self.calls == 1:
+                raise OutputParserException("invalid evidence mapping")
+            return ClaimExtraction(
+                claims=[
+                    EvidenceClaim(
+                        claim="The in-scope source answers the gap.",
+                        gap_ids=["gap-one"],
+                        evidence=[
+                            EvidenceQuote(
+                                source_id="S1", quote="IN-SCOPE DIRECT EVIDENCE"
+                            )
+                        ],
+                    )
+                ],
+                summary="The gap is answered.",
+            )
+
+    model = RetryingModel()
+    monkeypatch.setattr(graph_module, "create_deepseek_model", lambda *a, **k: model)
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    gap = _gap_record(status="active")
+    response = assess_gap_evidence(
+        _dimension_state(
+            active_gap=gap,
+            selected_sources=[
+                _accepted_source(
+                    "S1",
+                    "one.gov",
+                    content="IN-SCOPE DIRECT EVIDENCE",
+                    gap_ids=["gap-one"],
+                ),
+                _accepted_source(
+                    "S2", "two.gov", content="OUT-OF-SCOPE", gap_ids=["gap-two"]
+                ),
+            ],
+        ),
+        {},
+    )
+
+    assessment = response["gap_evidence_assessment"]
+    assert model.calls == 2
+    assert assessment["assessment_status"] == "completed_after_retry"
+    assert assessment["candidate_source_count"] == 1
+    assert assessment["matched_source_ids"] == ["S1"]
+    assert response["gap_assessment_failure_count"] == 0
+
+
+def test_quality_gap_evidence_is_assessed_deterministically(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+    monkeypatch.setattr(
+        graph_module,
+        "create_deepseek_model",
+        lambda *a, **k: pytest.fail("Quality gaps must not require an LLM."),
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    gap = _gap_record(
+        gap_id="quality-primary-source", status="active", origin="quality"
+    )
+
+    assessment = assess_gap_evidence(
         _dimension_state(
             active_gap=gap, selected_sources=[_accepted_source("S1", "one.gov")]
         ),
         {},
     )["gap_evidence_assessment"]
 
-    assert result["directly_answers_gap"] is False
-    assert result["has_progress"] is False
-    assert result["remaining_evidence"] == gap["expected_evidence"]
+    assert assessment["assessment_status"] == "deterministic_quality_check"
+    assert assessment["directly_answers_gap"] is True
+    assert assessment["matched_source_ids"] == ["S1"]
 
 
 def test_high_priority_gap_closes_only_with_direct_independent_evidence(monkeypatch):
@@ -559,8 +674,9 @@ def test_stalled_gap_replans_then_becomes_unresolvable(monkeypatch):
         {},
     )
     assert replanned["active_gap"]["strategy_level"] == 1
+    assert "exact expected fact" in replanned["active_gap"]["search_strategy"][0]
     assert (
-        "named authoritative institutions"
+        "still-missing requested source type"
         in replanned["active_gap"]["search_strategy"][0]
     )
 
@@ -578,6 +694,31 @@ def test_stalled_gap_replans_then_becomes_unresolvable(monkeypatch):
     )
     assert exhausted["gap_registry"]["gap-one"]["status"] == "unresolvable"
     assert route_gap_progress(exhausted) == "select_next_gap"
+
+
+def test_structured_gap_assessment_failure_does_not_repeat_web_search(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    gap = _gap_record(status="active")
+    result = update_gap_status(
+        _dimension_state(
+            active_gap_id="gap-one",
+            active_gap=gap,
+            gap_registry={"gap-one": gap},
+            selected_sources=[],
+            resolved_gap_ids=[],
+            gap_source_coverage_ids=[],
+            gap_evidence_assessment={
+                "has_progress": False,
+                "assessment_status": "structured_output_failure",
+            },
+        ),
+        {},
+    )
+
+    assert result["gap_route"] == "unresolvable"
+    assert result["gap_registry"]["gap-one"]["status"] == "unresolvable"
+    assert "would not repair" in result["gap_registry"]["gap-one"]["closure_reason"]
 
 
 def test_dimension_reflection_discovers_and_merges_a_new_gap(monkeypatch):
@@ -1036,17 +1177,6 @@ def test_parent_graph_runs_parallel_dimension_subgraphs(monkeypatch):
                         for source_id in source_ids
                     ]
                 )
-            if self.schema is GapEvidenceAssessment:
-                source_ids = list(
-                    dict.fromkeys(re.findall(r"\[(S[A-Za-z0-9-]+)\]", prompt))
-                )
-                return GapEvidenceAssessment(
-                    gap_id="gap-scope",
-                    directly_answers_gap=bool(source_ids),
-                    matched_source_ids=source_ids,
-                    supported_claims=["The evidence directly covers the scope."],
-                    remaining_evidence="",
-                )
             if self.schema is Reflection:
                 return Reflection(
                     is_sufficient=True,
@@ -1133,7 +1263,9 @@ def test_parent_graph_runs_parallel_dimension_subgraphs(monkeypatch):
         "max_research_loops": 1,
         "reasoning_model": "deepseek-v4-pro",
     }
-    result = graph.invoke(graph_input)
+    result = graph.invoke(
+        graph_input, {"configurable": {"max_sources_per_domain": 2}}
+    )
 
     assert len(result["dimension_results"]) == 2
     assert {item["dimension"]["title"] for item in result["dimension_results"]} == {
@@ -1148,7 +1280,13 @@ def test_parent_graph_runs_parallel_dimension_subgraphs(monkeypatch):
         in result["messages"][-1].content
     )
 
-    custom_events = list(graph.stream(graph_input, stream_mode="custom"))
+    custom_events = list(
+        graph.stream(
+            graph_input,
+            {"configurable": {"max_sources_per_domain": 2}},
+            stream_mode="custom",
+        )
+    )
     event_types = {event["type"] for event in custom_events}
     assert sum(event["type"] == "sources_evaluated" for event in custom_events) == 2
     assert {
@@ -1324,7 +1462,10 @@ def test_source_quality_selection_rejects_unassessed_and_excess_domain_sources(
         }
     )
 
-    result = evaluate_sources(_dimension_state(sources_gathered=sources), {})
+    result = evaluate_sources(
+        _dimension_state(sources_gathered=sources),
+        {"configurable": {"max_sources_per_domain": 2}},
+    )
 
     assert len(result["selected_sources"]) == 2
     assert {item["source_id"] for item in result["rejected_sources"]} == {
@@ -2251,6 +2392,114 @@ def test_claim_extraction_drops_unknown_source_ids(monkeypatch):
             "locator": "chars:0-15",
         }
     ]
+
+
+def test_claim_gap_mapping_requires_supporting_source_provenance(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class FakeClaimModel:
+        def with_structured_output(self, schema, method):
+            return self
+
+        def invoke(self, prompt):
+            return ClaimExtraction(
+                claims=[
+                    EvidenceClaim(
+                        claim="Supported fact",
+                        gap_ids=["gap-one"],
+                        evidence=[
+                            EvidenceQuote(source_id="S1", quote="Supported fact.")
+                        ],
+                    )
+                ],
+                summary="Summary",
+            )
+
+    monkeypatch.setattr(
+        graph_module, "create_deepseek_model", lambda *a, **k: FakeClaimModel()
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    result = extract_claims(
+        _dimension_state(
+            gap_registry={"gap-one": _gap_record()},
+            selected_sources=[
+                _accepted_source(
+                    "S1",
+                    "one.gov",
+                    content="Supported fact.",
+                    gap_ids=["gap-other"],
+                )
+            ],
+            reflection_assessment={},
+        ),
+        {},
+    )
+
+    assert result["claims"][0]["gap_ids"] == []
+    assert result["resolved_gap_ids"] == []
+    assert result["gap_registry"]["gap-one"]["status"] == "open"
+
+
+def test_verified_claims_reconcile_and_close_provenance_constrained_gap(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class FakeClaimModel:
+        def with_structured_output(self, schema, method):
+            return self
+
+        def invoke(self, prompt):
+            return ClaimExtraction(
+                claims=[
+                    EvidenceClaim(
+                        claim="The official result is 42.",
+                        gap_ids=["gap-one"],
+                        evidence=[
+                            EvidenceQuote(
+                                source_id="S1", quote="The official result is 42."
+                            ),
+                            EvidenceQuote(
+                                source_id="S2", quote="The official result is 42."
+                            ),
+                        ],
+                    )
+                ],
+                summary="Two independent official sources agree.",
+            )
+
+    monkeypatch.setattr(
+        graph_module, "create_deepseek_model", lambda *a, **k: FakeClaimModel()
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    gap = _gap_record(status="partial")
+    result = extract_claims(
+        _dimension_state(
+            gap_registry={"gap-one": gap},
+            resolved_gap_ids=[],
+            gap_source_coverage_ids=[],
+            selected_sources=[
+                _accepted_source(
+                    "S1",
+                    "one.gov",
+                    content="The official result is 42.",
+                    gap_ids=["gap-one"],
+                ),
+                _accepted_source(
+                    "S2",
+                    "two.gov",
+                    content="The official result is 42.",
+                    gap_ids=["gap-one"],
+                ),
+            ],
+            reflection_assessment={},
+        ),
+        {},
+    )
+
+    reconciled = result["gap_registry"]["gap-one"]
+    assert reconciled["status"] == "closed"
+    assert reconciled["matched_source_ids"] == ["S1", "S2"]
+    assert reconciled["supported_claims"] == ["The official result is 42."]
+    assert result["resolved_gap_ids"] == ["gap-one"]
 
 
 def test_claim_extraction_repairs_legacy_source_id_only_output(monkeypatch):

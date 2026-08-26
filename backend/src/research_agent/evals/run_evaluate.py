@@ -127,6 +127,22 @@ async def evaluate_example(
                 int(result.get("search_failure_count", 0))
                 for result in outputs.get("dimension_results", [])
             ),
+            "known_gaps": sum(
+                int(result.get("known_gap_count", 0))
+                for result in outputs.get("dimension_results", [])
+            ),
+            "resolved_gaps": sum(
+                int(result.get("resolved_gap_count", 0))
+                for result in outputs.get("dimension_results", [])
+            ),
+            "no_gain_loops": sum(
+                int(result.get("no_gain_loop_count", 0))
+                for result in outputs.get("dimension_results", [])
+            ),
+            "gap_assessment_failures": sum(
+                int(result.get("gap_assessment_failure_count", 0))
+                for result in outputs.get("dimension_results", [])
+            ),
             "material_conflicts": sum(
                 bool(conflict.get("material"))
                 for conflict in outputs.get("claim_conflicts", [])

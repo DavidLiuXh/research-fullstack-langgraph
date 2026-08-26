@@ -382,6 +382,7 @@ class EvidenceClaim(BaseModel):
     counter_evidence: list[EvidenceQuote] = Field(default_factory=list)
     uncertainty: str = ""
     confidence: float = Field(default=0.5, ge=0, le=1)
+    gap_ids: list[str] = Field(default_factory=list)
 
     @property
     def source_ids(self) -> list[str]:
