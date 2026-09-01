@@ -100,6 +100,19 @@ async def evaluate_example(
             errors.append(
                 f"{type(evaluator).__name__}: {type(error).__name__}: {error}"
             )
+    gap_diagnostics = [
+        diagnostic
+        for result in outputs.get("dimension_results", [])
+        for diagnostic in result.get("gap_diagnostics", [])
+    ]
+    known_gap_count = sum(
+        int(result.get("known_gap_count", 0))
+        for result in outputs.get("dimension_results", [])
+    )
+    resolved_gap_count = sum(
+        int(result.get("resolved_gap_count", 0))
+        for result in outputs.get("dimension_results", [])
+    )
     return {
         "id": example.get("id", "unknown"),
         "question": inputs["messages"][0]["content"],
@@ -107,6 +120,7 @@ async def evaluate_example(
         "target_attempts": len(target_errors) + 1,
         "scores": scores,
         "errors": errors,
+        "gap_diagnostics": gap_diagnostics,
         "summary": {
             "dimensions": len(outputs.get("dimension_results", [])),
             "sources": len(outputs.get("sources", [])),
@@ -127,13 +141,15 @@ async def evaluate_example(
                 int(result.get("search_failure_count", 0))
                 for result in outputs.get("dimension_results", [])
             ),
-            "known_gaps": sum(
-                int(result.get("known_gap_count", 0))
-                for result in outputs.get("dimension_results", [])
-            ),
-            "resolved_gaps": sum(
-                int(result.get("resolved_gap_count", 0))
-                for result in outputs.get("dimension_results", [])
+            "known_gaps": known_gap_count,
+            "resolved_gaps": resolved_gap_count,
+            "unresolved_gaps": (
+                sum(
+                    diagnostic.get("status") != "closed"
+                    for diagnostic in gap_diagnostics
+                )
+                if gap_diagnostics
+                else max(known_gap_count - resolved_gap_count, 0)
             ),
             "no_gain_loops": sum(
                 int(result.get("no_gain_loop_count", 0))
@@ -222,6 +238,83 @@ def render_markdown(report: dict[str, Any]) -> str:
         for score in result.get("scores", []):
             comment = f" — {score.get('comment')}" if score.get("comment") else ""
             lines.append(f"- `{score['key']}`: {float(score['score']):.3f}{comment}")
+        diagnostics = result.get("gap_diagnostics", [])
+        if diagnostics:
+            lines.extend(
+                [
+                    "",
+                    "#### Gap Diagnostics",
+                    "",
+                    "| Dimension | Gap | Priority | Status | Attempts | Blockers | Evidence checks | Required source types | Matched evidence | Remaining evidence |",
+                    "| --- | --- | --- | --- | ---: | --- | --- | --- | --- | --- |",
+                ]
+            )
+
+            def table_text(value: object, *, limit: int = 240) -> str:
+                if isinstance(value, list):
+                    text = ", ".join(str(item) for item in value)
+                else:
+                    text = str(value or "")
+                text = " ".join(text.split()).replace("|", "\\|")
+                return text if len(text) <= limit else text[: limit - 1] + "…"
+
+            for diagnostic in sorted(
+                diagnostics,
+                key=lambda item: (
+                    item.get("status") == "closed",
+                    str(item.get("dimension_title", "")),
+                    str(item.get("gap_id", "")),
+                ),
+            ):
+                matched_evidence = [
+                    ":".join(
+                        filter(
+                            None,
+                            [
+                                str(source.get("source_id", "")),
+                                str(source.get("source_type", "")),
+                                str(source.get("domain", "")),
+                            ],
+                        )
+                    )
+                    for source in diagnostic.get("matched_sources", [])
+                ]
+                evidence_checks = (
+                    f"direct={bool(diagnostic.get('direct_evidence_confirmed'))}; "
+                    f"claims={int(diagnostic.get('supported_claim_count', 0))}; "
+                    "requested_type="
+                    f"{bool(diagnostic.get('requested_source_type_satisfied'))}; "
+                    "independent="
+                    f"{int(diagnostic.get('independent_source_count', 0))}/"
+                    f"{int(diagnostic.get('required_independent_source_count', 1))}; "
+                    f"assessment={diagnostic.get('assessment_status', 'unknown')}"
+                )
+                lines.append(
+                    "| "
+                    + " | ".join(
+                        [
+                            table_text(diagnostic.get("dimension_title")),
+                            table_text(diagnostic.get("gap_id")),
+                            table_text(diagnostic.get("priority")),
+                            table_text(diagnostic.get("status")),
+                            str(int(diagnostic.get("attempt_count", 0))),
+                            table_text(
+                                diagnostic.get("blocker_details")
+                                or diagnostic.get("closure_blockers", [])
+                            ),
+                            table_text(evidence_checks),
+                            table_text(diagnostic.get("required_source_types", [])),
+                            table_text(matched_evidence),
+                            table_text(
+                                ""
+                                if diagnostic.get("status") == "closed"
+                                else diagnostic.get("remaining_evidence")
+                                or diagnostic.get("expected_evidence")
+                            ),
+                        ]
+                    )
+                    + " |"
+                )
         lines.append("")
     return "\n".join(lines)
 

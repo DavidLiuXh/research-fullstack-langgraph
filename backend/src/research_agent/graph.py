@@ -2255,6 +2255,104 @@ def research_dimension(state: DimensionInput, config: RunnableConfig):
         for source in result.get("selected_sources", [])
         if source.get("quality_status") == "accepted"
     ]
+    accepted_by_id = {source["source_id"]: source for source in accepted_sources}
+    gap_diagnostics = []
+    for gap_id, gap in sorted(gap_registry.items()):
+        matched_source_ids = list(dict.fromkeys(gap.get("matched_source_ids", [])))
+        matched_sources = [
+            {
+                "source_id": source_id,
+                "title": accepted_by_id[source_id].get("title", ""),
+                "url": accepted_by_id[source_id].get("url", ""),
+                "domain": accepted_by_id[source_id].get("domain", ""),
+                "source_type": accepted_by_id[source_id].get("source_type", "unknown"),
+                "is_primary_source": bool(
+                    accepted_by_id[source_id].get("is_primary_source")
+                ),
+                "is_authoritative_source": bool(
+                    accepted_by_id[source_id].get("is_authoritative_source")
+                ),
+            }
+            for source_id in matched_source_ids
+            if source_id in accepted_by_id
+        ]
+        matched_source_types = sorted(
+            {
+                source["source_type"]
+                for source in matched_sources
+                if source["source_type"] != "unknown"
+            }
+        )
+        closure_blockers = list(gap.get("closure_blockers", []))
+        blocker_details = []
+        for blocker in closure_blockers:
+            if blocker == "missing_requested_source_type":
+                blocker_details.append(
+                    "Required source types "
+                    f"{gap.get('required_source_types', [])} were not found among "
+                    f"matched types {matched_source_types}."
+                )
+            elif blocker == "insufficient_independent_sources":
+                blocker_details.append(
+                    "Independent publisher coverage is "
+                    f"{int(gap.get('independent_source_count', 0))}/"
+                    f"{int(gap.get('required_independent_source_count', 1))}."
+                )
+            elif blocker == "missing_direct_evidence":
+                blocker_details.append(
+                    "No accepted, quote-verified evidence directly answers the gap."
+                )
+            elif blocker == "missing_supported_claim":
+                blocker_details.append(
+                    "No quote-verified factual claim currently supports the gap."
+                )
+            elif blocker == "unresolved_contradiction":
+                blocker_details.append(
+                    "Contradictory evidence remains unresolved: "
+                    + ", ".join(gap.get("contradictory_source_ids", []))
+                )
+        gap_diagnostics.append(
+            {
+                "dimension_id": str(result["dimension"]["id"]),
+                "dimension_title": result["dimension"]["title"],
+                "gap_id": gap_id,
+                "origin": gap.get("origin", "unknown"),
+                "priority": gap.get("priority", "unknown"),
+                "question": gap.get("question", ""),
+                "expected_evidence": gap.get("expected_evidence", ""),
+                "required_source_types": gap.get("required_source_types", []),
+                "status": gap.get("status", "open"),
+                "closure_blockers": closure_blockers,
+                "blocker_details": blocker_details,
+                "closure_reason": gap.get("closure_reason", ""),
+                "remaining_evidence": gap.get("remaining_evidence", ""),
+                "assessment_status": gap.get("assessment_status", "not_assessed"),
+                "attempt_count": int(gap.get("attempt_count", 0)),
+                "no_progress_count": int(gap.get("no_progress_count", 0)),
+                "strategy_level": int(gap.get("strategy_level", 0)),
+                "direct_evidence_confirmed": bool(gap.get("direct_evidence_confirmed")),
+                "supported_claim_count": len(gap.get("supported_claims", [])),
+                "supported_claims": gap.get("supported_claims", []),
+                "contradictory_source_ids": gap.get("contradictory_source_ids", []),
+                "requested_source_type_satisfied": bool(
+                    gap.get("requested_source_type_satisfied")
+                ),
+                "independent_source_count": int(gap.get("independent_source_count", 0)),
+                "required_independent_source_count": int(
+                    gap.get("required_independent_source_count", 1)
+                ),
+                "matched_source_ids": matched_source_ids,
+                "matched_source_types": matched_source_types,
+                "matched_sources": matched_sources,
+                "search_strategy": gap.get("search_strategy", []),
+                "excluded_domains": gap.get("excluded_domains", []),
+                "missing_matched_source_ids": [
+                    source_id
+                    for source_id in matched_source_ids
+                    if source_id not in accepted_by_id
+                ],
+            }
+        )
     dimension_result = {
         "research_run_id": result["research_run_id"],
         "dimension": result["dimension"],
@@ -2319,6 +2417,7 @@ def research_dimension(state: DimensionInput, config: RunnableConfig):
             int(gain.get("total_gain", 0)) <= 0
             for gain in result.get("evidence_gain_history", [])
         ),
+        "gap_diagnostics": gap_diagnostics,
     }
     emit_research_event(
         "dimension_completed",
