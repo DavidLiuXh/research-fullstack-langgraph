@@ -96,6 +96,7 @@ class DimensionResult(TypedDict):
     independent_source_gap_count: int
     gap_assessment_failure_count: int
     no_gain_loop_count: int
+    gap_diagnostics: list[dict]
 
 
 class OverallState(TypedDict):

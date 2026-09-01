@@ -409,7 +409,36 @@ def test_evaluate_example_retains_judge_failure_and_deterministic_scores():
             return {
                 "report_draft": "No citations.",
                 "sources": [],
-                "dimension_results": [],
+                "dimension_results": [
+                    {
+                        "completion_status": "partial",
+                        "gap_diagnostics": [
+                            {
+                                "dimension_title": "Market",
+                                "gap_id": "gap-market",
+                                "priority": "medium",
+                                "status": "unresolvable",
+                                "attempt_count": 2,
+                                "closure_blockers": ["missing_requested_source_type"],
+                                "required_source_types": ["government"],
+                                "direct_evidence_confirmed": True,
+                                "supported_claim_count": 1,
+                                "requested_source_type_satisfied": False,
+                                "independent_source_count": 1,
+                                "required_independent_source_count": 1,
+                                "assessment_status": "completed",
+                                "matched_sources": [
+                                    {
+                                        "source_id": "S1",
+                                        "source_type": "news",
+                                        "domain": "example.com",
+                                    }
+                                ],
+                                "remaining_evidence": "An official source",
+                            }
+                        ],
+                    }
+                ],
                 "custom_events": [],
                 "node_trajectory": [],
                 "report_revision_count": 0,
@@ -432,6 +461,8 @@ def test_evaluate_example_retains_judge_failure_and_deterministic_scores():
     )
     assert result["scores"]
     assert "judge unavailable" in result["errors"][0]
+    assert result["summary"]["unresolved_gaps"] == 1
+    assert result["gap_diagnostics"][0]["gap_id"] == "gap-market"
 
 
 def test_aggregate_and_markdown_report_expose_metric_coverage():
@@ -465,6 +496,55 @@ def test_aggregate_and_markdown_report_expose_metric_coverage():
         }
     )
     assert "| metric | 1.000 | 1/2 |" in markdown
+
+
+def test_markdown_report_renders_gap_diagnostics():
+    result = {
+        "id": "case",
+        "duration_seconds": 1,
+        "scores": [],
+        "errors": [],
+        "gap_diagnostics": [
+            {
+                "dimension_title": "Market | Scope",
+                "gap_id": "gap-source-type",
+                "priority": "medium",
+                "status": "unresolvable",
+                "attempt_count": 2,
+                "closure_blockers": ["missing_requested_source_type"],
+                "required_source_types": ["government"],
+                "direct_evidence_confirmed": True,
+                "supported_claim_count": 1,
+                "requested_source_type_satisfied": False,
+                "independent_source_count": 1,
+                "required_independent_source_count": 1,
+                "assessment_status": "completed",
+                "matched_sources": [
+                    {
+                        "source_id": "S1",
+                        "source_type": "news",
+                        "domain": "example.com",
+                    }
+                ],
+                "remaining_evidence": "An official source",
+            }
+        ],
+    }
+    report = {
+        "generated_at": "now",
+        "dataset": "smoke",
+        "evaluation_model": "deepseek",
+        "aggregate": aggregate_results([result]),
+        "results": [result],
+    }
+
+    markdown = render_markdown(report)
+
+    assert "#### Gap Diagnostics" in markdown
+    assert "Market \\| Scope" in markdown
+    assert "missing_requested_source_type" in markdown
+    assert "direct=True; claims=1; requested_type=False" in markdown
+    assert "S1:news:example.com" in markdown
 
 
 def test_runner_rejects_deadlocking_or_empty_settings():

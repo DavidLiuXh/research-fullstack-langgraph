@@ -1263,11 +1263,24 @@ def test_parent_graph_runs_parallel_dimension_subgraphs(monkeypatch):
         "max_research_loops": 1,
         "reasoning_model": "deepseek-v4-pro",
     }
-    result = graph.invoke(
-        graph_input, {"configurable": {"max_sources_per_domain": 2}}
-    )
+    result = graph.invoke(graph_input, {"configurable": {"max_sources_per_domain": 2}})
 
     assert len(result["dimension_results"]) == 2
+    assert all(item["gap_diagnostics"] for item in result["dimension_results"])
+    assert all(
+        {
+            "gap_id",
+            "status",
+            "closure_blockers",
+            "required_source_types",
+            "matched_sources",
+            "attempt_count",
+            "remaining_evidence",
+        }
+        <= set(diagnostic)
+        for item in result["dimension_results"]
+        for diagnostic in item["gap_diagnostics"]
+    )
     assert {item["dimension"]["title"] for item in result["dimension_results"]} == {
         "Market",
         "Technology",
