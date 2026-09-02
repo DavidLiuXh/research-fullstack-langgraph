@@ -8,6 +8,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from research_agent.graph import (
     analyze_research_topic,
     assess_gap_evidence,
+    audit_final_gap_ledger,
     audit_report,
     build_safe_report,
     detect_claim_conflicts,
@@ -29,6 +30,7 @@ from research_agent.graph import (
     revise_report,
     route_dimension_reflection,
     route_dimension_review,
+    route_final_gap_audit,
     route_gap_progress,
     route_gap_selection,
     route_report_audit,
@@ -456,6 +458,117 @@ def test_gap_evidence_assessment_does_not_count_topic_only_source_as_gain(monkey
     assert result["has_progress"] is False
 
 
+def test_gap_evidence_rejects_quote_outside_explicit_future_horizon(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class OutOfHorizonModel:
+        def with_structured_output(self, schema, method):
+            return self
+
+        def invoke(self, prompt):
+            return ClaimExtraction(
+                claims=[
+                    EvidenceClaim(
+                        claim="China planned new vehicle standards in 2024.",
+                        gap_ids=["gap-policy-risks"],
+                        evidence=[
+                            EvidenceQuote(
+                                source_id="S2024",
+                                quote="In 2024, China planned new vehicle standards.",
+                            )
+                        ],
+                    )
+                ],
+                summary="No evidence covers policy changes after 2026.",
+            )
+
+    monkeypatch.setattr(
+        graph_module, "create_deepseek_model", lambda *a, **k: OutOfHorizonModel()
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    gap = _gap_record(
+        "gap-policy-risks",
+        status="active",
+        question="What policy changes beyond 2026 could affect the NEV market?",
+        expected_evidence=(
+            "Future subsidy, emissions standards, or trade measures after 2026."
+        ),
+    )
+    result = assess_gap_evidence(
+        _dimension_state(
+            active_gap=gap,
+            selected_sources=[
+                _accepted_source(
+                    "S2024",
+                    "english.www.gov.cn",
+                    content="In 2024, China planned new vehicle standards.",
+                    published_date="2027-01-01",
+                    gap_ids=["gap-policy-risks"],
+                )
+            ],
+        ),
+        {},
+    )["gap_evidence_assessment"]
+
+    assert result["matched_source_ids"] == []
+    assert result["verified_claims"] == []
+    assert "temporal_scope_mismatch" in result["scope_rejection_reasons"]
+    assert result["has_progress"] is False
+
+
+def test_gap_evidence_rejects_quote_outside_semantic_scope(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class OffTopicModel:
+        def with_structured_output(self, schema, method):
+            return self
+
+        def invoke(self, prompt):
+            return ClaimExtraction(
+                claims=[
+                    EvidenceClaim(
+                        claim="Rainfall increased agricultural production.",
+                        gap_ids=["gap-battery-swapping"],
+                        evidence=[
+                            EvidenceQuote(
+                                source_id="Sweather",
+                                quote="Rainfall increased agricultural production.",
+                            )
+                        ],
+                    )
+                ],
+                summary="The required infrastructure evidence is still missing.",
+            )
+
+    monkeypatch.setattr(
+        graph_module, "create_deepseek_model", lambda *a, **k: OffTopicModel()
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    gap = _gap_record(
+        "gap-battery-swapping",
+        status="active",
+        question="How many battery swapping stations operate nationwide?",
+        expected_evidence="Battery swapping station counts, operators, and growth.",
+    )
+    result = assess_gap_evidence(
+        _dimension_state(
+            active_gap=gap,
+            selected_sources=[
+                _accepted_source(
+                    "Sweather",
+                    "example.org",
+                    content="Rainfall increased agricultural production.",
+                    gap_ids=["gap-battery-swapping"],
+                )
+            ],
+        ),
+        {},
+    )["gap_evidence_assessment"]
+
+    assert result["verified_claims"] == []
+    assert "semantic_scope_mismatch" in result["scope_rejection_reasons"]
+
+
 def test_gap_evidence_parser_failure_is_conservatively_no_progress(monkeypatch):
     graph_module = importlib.import_module("research_agent.graph")
 
@@ -607,6 +720,92 @@ def test_high_priority_gap_closes_only_with_direct_independent_evidence(monkeypa
     assert result["evidence_gain_history"][0]["total_gain"] == 4
 
 
+def test_gap_claim_ledger_survives_later_global_extraction_omission(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class GapThenGlobalModel:
+        calls = 0
+
+        def with_structured_output(self, schema, method):
+            return self
+
+        def invoke(self, prompt):
+            self.calls += 1
+            if self.calls == 1:
+                return ClaimExtraction(
+                    claims=[
+                        EvidenceClaim(
+                            claim="The official result is 42.",
+                            gap_ids=["gap-one"],
+                            evidence=[
+                                EvidenceQuote(
+                                    source_id=source_id,
+                                    quote="The official result is 42.",
+                                )
+                                for source_id in ["S1", "S2"]
+                            ],
+                        )
+                    ],
+                    summary="The active Gap is answered.",
+                )
+            return ClaimExtraction(
+                claims=[], summary="The global pass emitted no additional claims."
+            )
+
+    model = GapThenGlobalModel()
+    monkeypatch.setattr(graph_module, "create_deepseek_model", lambda *a, **k: model)
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    gap = _gap_record(status="active")
+    sources = [
+        _accepted_source(
+            "S1",
+            "one.gov",
+            content="The official result is 42.",
+            gap_ids=["gap-one"],
+        ),
+        _accepted_source(
+            "S2",
+            "two.gov",
+            content="The official result is 42.",
+            gap_ids=["gap-one"],
+        ),
+    ]
+    assessment = assess_gap_evidence(
+        _dimension_state(active_gap=gap, selected_sources=sources), {}
+    )["gap_evidence_assessment"]
+    updated = update_gap_status(
+        _dimension_state(
+            active_gap_id="gap-one",
+            active_gap=gap,
+            gap_registry={"gap-one": gap},
+            selected_sources=sources,
+            resolved_gap_ids=[],
+            gap_source_coverage_ids=[],
+            gap_evidence_assessment=assessment,
+            gap_claim_ledger=[],
+        ),
+        {},
+    )
+
+    assert updated["gap_registry"]["gap-one"]["status"] == "closed"
+    assert len(updated["gap_claim_ledger"]) == 1
+    extracted = extract_claims(
+        _dimension_state(
+            gap_registry=updated["gap_registry"],
+            resolved_gap_ids=updated["resolved_gap_ids"],
+            gap_source_coverage_ids=updated["gap_source_coverage_ids"],
+            selected_sources=sources,
+            gap_claim_ledger=updated["gap_claim_ledger"],
+            reflection_assessment={},
+        ),
+        {},
+    )
+
+    assert model.calls == 2
+    assert extracted["claims"][0]["gap_ids"] == ["gap-one"]
+    assert extracted["gap_registry"]["gap-one"]["status"] == "closed"
+
+
 def test_primary_quality_gap_requires_an_actual_primary_source(monkeypatch):
     graph_module = importlib.import_module("research_agent.graph")
     monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
@@ -694,6 +893,29 @@ def test_stalled_gap_replans_then_becomes_unresolvable(monkeypatch):
     )
     assert exhausted["gap_registry"]["gap-one"]["status"] == "unresolvable"
     assert route_gap_progress(exhausted) == "select_next_gap"
+
+
+def test_replan_search_targets_scope_rejection_reason(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    gap = _gap_record(
+        "gap-policy-risks",
+        status="partial",
+        closure_blockers=["missing_direct_evidence"],
+        scope_rejection_reasons=["temporal_scope_mismatch"],
+    )
+
+    result = replan_search(
+        _dimension_state(
+            active_gap_id="gap-policy-risks",
+            gap_registry={"gap-policy-risks": gap},
+        ),
+        {},
+    )
+
+    assert (
+        "exact required year or horizon" in result["active_gap"]["search_strategy"][0]
+    )
 
 
 def test_structured_gap_assessment_failure_does_not_repeat_web_search(monkeypatch):
@@ -917,7 +1139,179 @@ def test_dimension_subgraph_contains_complete_gap_lifecycle():
         "dimension_reflection",
         "merge_gap_registry",
         "extract_claims",
+        "audit_final_gap_ledger",
     } <= node_names
+
+
+def test_final_gap_audit_revokes_closed_gap_with_ledger_blockers(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    source = _accepted_source("Skept", "official.example", gap_ids=["gap-one"])
+    result = audit_final_gap_ledger(
+        _dimension_state(
+            selected_sources=[source],
+            gap_registry={
+                "gap-one": _gap_record(
+                    status="closed",
+                    attempt_count=3,
+                    matched_source_ids=["Skept", "Smissing"],
+                    supported_claims=["An earlier unverified claim."],
+                    direct_evidence_confirmed=True,
+                )
+            },
+            resolved_gap_ids=["gap-one"],
+            gap_source_coverage_ids=["gap-one"],
+            claims=[
+                {
+                    "claim": "The retained source supports the claim.",
+                    "gap_ids": ["gap-one"],
+                    "supporting_source_ids": ["Skept"],
+                    "supporting_evidence": [
+                        {
+                            "source_id": "Skept",
+                            "quote": source["content"],
+                            "locator": "",
+                        }
+                    ],
+                }
+            ],
+            reflection_assessment={
+                "is_sufficient": True,
+                "missing_questions": [],
+                "contradictions": [],
+            },
+            completion_status="sufficient",
+        ),
+        {},
+    )
+
+    gap = result["gap_registry"]["gap-one"]
+    assert gap["status"] == "unresolvable"
+    assert gap["closure_blockers"] == ["insufficient_independent_sources"]
+    assert gap["matched_source_ids"] == ["Skept"]
+    assert gap["removed_matched_source_ids"] == ["Smissing"]
+    assert result["resolved_gap_ids"] == []
+    assert result["is_sufficient"] is False
+    assert result["final_gap_audit"]["revoked_gap_ids"] == ["gap-one"]
+
+
+def test_final_gap_audit_keeps_gap_closed_when_ledger_satisfies_requirements(
+    monkeypatch,
+):
+    graph_module = importlib.import_module("research_agent.graph")
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    sources = [
+        _accepted_source("Sone", "agency-one.example", gap_ids=["gap-one"]),
+        _accepted_source("Stwo", "agency-two.example", gap_ids=["gap-one"]),
+    ]
+    result = audit_final_gap_ledger(
+        _dimension_state(
+            selected_sources=sources,
+            gap_registry={
+                "gap-one": _gap_record(
+                    status="closed",
+                    matched_source_ids=["Sone", "Stwo"],
+                    direct_evidence_confirmed=True,
+                )
+            },
+            resolved_gap_ids=["gap-one"],
+            claims=[
+                {
+                    "claim": "Two independent official sources support the claim.",
+                    "gap_ids": ["gap-one"],
+                    "supporting_source_ids": ["Sone", "Stwo"],
+                    "supporting_evidence": [
+                        {
+                            "source_id": source["source_id"],
+                            "quote": source["content"],
+                            "locator": "",
+                        }
+                        for source in sources
+                    ],
+                }
+            ],
+            reflection_assessment={
+                "is_sufficient": True,
+                "missing_questions": [],
+                "contradictions": [],
+            },
+        ),
+        {},
+    )
+
+    gap = result["gap_registry"]["gap-one"]
+    assert gap["status"] == "closed"
+    assert gap["closure_blockers"] == []
+    assert gap["final_ledger_audit_status"] == "passed"
+    assert result["resolved_gap_ids"] == ["gap-one"]
+    assert result["is_sufficient"] is True
+    assert result["final_gap_audit"]["passes"] is True
+
+
+def test_final_gap_audit_replans_revoked_gap_with_remaining_budget(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    gap = _gap_record(
+        "gap-policy-risks",
+        status="closed",
+        priority="medium",
+        attempt_count=1,
+        matched_source_ids=["Sweak"],
+        supported_claims=["An unverified policy claim."],
+        direct_evidence_confirmed=True,
+        expected_evidence="A post-2026 official policy announcement.",
+    )
+    result = audit_final_gap_ledger(
+        _dimension_state(
+            max_research_loops=2,
+            selected_sources=[
+                _accepted_source(
+                    "Sweak", "official.example", gap_ids=["gap-policy-risks"]
+                )
+            ],
+            gap_registry={"gap-policy-risks": gap},
+            resolved_gap_ids=["gap-policy-risks"],
+            gap_source_coverage_ids=["gap-policy-risks"],
+            claims=[],
+            gap_claim_ledger=[],
+            reflection_assessment={"contradictions": []},
+            completion_status="sufficient",
+        ),
+        {},
+    )
+
+    audited = result["gap_registry"]["gap-policy-risks"]
+    assert audited["status"] == "partial"
+    assert audited["remaining_evidence"] == gap["expected_evidence"]
+    assert result["final_gap_audit"]["retryable_gap_ids"] == ["gap-policy-risks"]
+    assert result["active_gap_id"] == "gap-policy-risks"
+    assert result["completion_status"] == "researching"
+    assert route_final_gap_audit(result) == "replan_search"
+
+
+def test_final_gap_audit_keeps_deterministic_quality_gap_without_claim(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    gap = _gap_record(
+        "quality-primary-source",
+        status="closed",
+        origin="quality",
+        required_source_types=["government", "academic"],
+    )
+    result = audit_final_gap_ledger(
+        _dimension_state(
+            selected_sources=[_accepted_source("Sprimary", "official.example")],
+            gap_registry={"quality-primary-source": gap},
+            resolved_gap_ids=["quality-primary-source"],
+            claims=[],
+            gap_claim_ledger=[],
+            reflection_assessment={"contradictions": []},
+        ),
+        {},
+    )
+
+    assert result["gap_registry"]["quality-primary-source"]["status"] == "closed"
+    assert result["resolved_gap_ids"] == ["quality-primary-source"]
 
 
 def test_initialize_research_topic_resets_previous_clarification_state():
@@ -1487,6 +1881,118 @@ def test_source_quality_selection_rejects_unassessed_and_excess_domain_sources(
     }
 
 
+def test_source_selection_preserves_evidence_already_used_to_close_a_gap(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class NewSourceOnlyAssessmentModel:
+        def with_structured_output(self, schema, method):
+            return self
+
+        def invoke(self, prompt):
+            return SourceAssessmentList(
+                assessments=[
+                    SourceAssessment(
+                        source_id="Snew",
+                        source_type="government",
+                        authority_score=0.95,
+                        relevance_score=0.95,
+                        recency_score=0.95,
+                        is_primary_source=True,
+                        is_likely_repost=False,
+                        supported_topics=["new evidence"],
+                        rejection_reasons=[],
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(
+        graph_module,
+        "create_deepseek_model",
+        lambda *args, **kwargs: NewSourceOnlyAssessmentModel(),
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    protected_one = _accepted_source(
+        "Sstable-1",
+        "official.example",
+        gap_ids=["gap-one"],
+    )
+    protected_two = _accepted_source(
+        "Sstable-2",
+        "official.example",
+        gap_ids=["gap-one"],
+    )
+    extra_protected = [
+        _accepted_source(
+            f"Sstable-{index}",
+            "official.example",
+            gap_ids=["gap-one"],
+        )
+        for index in range(3, 7)
+    ]
+    protected_sources = [protected_one, protected_two, *extra_protected]
+    partial_evidence = _accepted_source(
+        "Spartial",
+        "partial.example",
+        gap_ids=["gap-two"],
+    )
+    replacement_alias = {
+        **protected_one,
+        "source_id": "Salias",
+        "score": 1.0,
+    }
+    new_source = _accepted_source(
+        "Snew",
+        "new.example",
+        quality_status=None,
+        gap_ids=["gap-two"],
+    )
+
+    result = evaluate_sources(
+        _dimension_state(
+            sources_gathered=[
+                replacement_alias,
+                protected_two,
+                *extra_protected,
+                partial_evidence,
+                new_source,
+            ],
+            selected_sources=[*protected_sources, partial_evidence],
+            gap_registry={
+                "gap-one": _gap_record(
+                    status="closed",
+                    matched_source_ids=[
+                        source["source_id"] for source in protected_sources
+                    ],
+                ),
+                "gap-two": _gap_record(
+                    "gap-two",
+                    status="partial",
+                    matched_source_ids=["Spartial"],
+                    retained_evidence_source_ids=["Spartial"],
+                ),
+            },
+            resolved_gap_ids=["gap-one"],
+        ),
+        {
+            "configurable": {
+                "max_sources_per_domain": 1,
+                "max_selected_sources_per_dimension": 1,
+                "max_source_candidates_per_dimension": 5,
+                "min_accepted_sources_per_dimension": 1,
+            }
+        },
+    )
+
+    selected_by_id = {
+        source["source_id"]: source for source in result["selected_sources"]
+    }
+    assert {source["source_id"] for source in protected_sources} <= set(selected_by_id)
+    assert "Spartial" in selected_by_id
+    assert "Salias" not in selected_by_id
+    assert selected_by_id["Sstable-1"]["protected_gap_ids"] == ["gap-one"]
+    assert selected_by_id["Sstable-2"]["quality_status"] == "accepted"
+
+
 def test_source_assessment_normalizes_deepseek_industry_media_alias():
     assessment = SourceAssessment.model_validate(
         {
@@ -1503,6 +2009,56 @@ def test_source_assessment_normalizes_deepseek_industry_media_alias():
     )
 
     assert assessment.source_type == "specialist_media"
+
+
+def test_government_hosted_wire_story_is_not_treated_as_primary_evidence(
+    monkeypatch,
+):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class MisclassifiedRepostModel:
+        def with_structured_output(self, schema, method):
+            return self
+
+        def invoke(self, prompt):
+            return SourceAssessmentList(
+                assessments=[
+                    SourceAssessment(
+                        source_id="Srepost",
+                        source_type="government",
+                        authority_score=0.95,
+                        relevance_score=0.95,
+                        recency_score=0.8,
+                        is_primary_source=True,
+                        is_likely_repost=False,
+                        supported_topics=["vehicle standards"],
+                        rejection_reasons=[],
+                    )
+                ]
+            )
+
+    monkeypatch.setattr(
+        graph_module,
+        "create_deepseek_model",
+        lambda *args, **kwargs: MisclassifiedRepostModel(),
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    source = _accepted_source(
+        "Srepost",
+        "english.www.gov.cn",
+        url="https://english.www.gov.cn/news/example.html",
+        canonical_url="https://english.www.gov.cn/news/example.html",
+        content="Xinhua reports that new vehicle standards are planned.",
+        quality_status=None,
+    )
+
+    result = evaluate_sources(_dimension_state(sources_gathered=[source]), {})
+
+    evaluated = result["evaluated_sources"][0]
+    assert evaluated["source_type"] == "major_media"
+    assert evaluated["is_primary_source"] is False
+    assert evaluated["is_likely_repost"] is True
+    assert evaluated["quality_status"] == "rejected"
 
 
 def test_unknown_source_type_cannot_use_model_scores_to_become_accepted(monkeypatch):

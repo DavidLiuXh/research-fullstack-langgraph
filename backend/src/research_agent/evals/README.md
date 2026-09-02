@@ -9,7 +9,7 @@ The first-phase suite combines deterministic checks with DeepSeek-as-judge:
 
 - citation, claim-source, and exact evidence-quote validity
 - claim evidence coverage and semantic groundedness
-- dimension sufficiency, gap resolution, and per-loop evidence gain
+- dimension sufficiency, gap resolution, final-ledger consistency, and per-loop evidence gain
 - primary and authoritative source coverage and source-quality metadata
 - domain diversity and workflow trajectory completeness
 - clarification routing and report revision budget compliance

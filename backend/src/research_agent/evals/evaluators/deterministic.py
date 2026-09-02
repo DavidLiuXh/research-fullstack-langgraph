@@ -182,6 +182,23 @@ def evaluate_deterministic_quality(
         )
         >= 2
     ]
+    ledger_consistent_dimensions = []
+    for result in dimensions:
+        audit = result.get("final_gap_audit", {})
+        diagnostics = result.get("gap_diagnostics", [])
+        illegal_closed_gaps = [
+            gap
+            for gap in diagnostics
+            if gap.get("status") == "closed" and gap.get("closure_blockers")
+        ]
+        if (
+            audit
+            and not illegal_closed_gaps
+            and int(audit.get("gap_count", -1)) == len(diagnostics)
+            and int(audit.get("resolved_gap_count", -1))
+            == int(result.get("resolved_gap_count", -2))
+        ):
+            ledger_consistent_dimensions.append(result)
 
     event_types = {
         event.get("type")
@@ -199,6 +216,7 @@ def evaluate_deterministic_quality(
         "gap_status_updated",
         "reflection_completed",
         "claims_extracted",
+        "final_gap_ledger_audited",
         "report_evidence_prepared",
         "claim_conflicts_detected",
         "drafting_report",
@@ -314,6 +332,16 @@ def evaluate_deterministic_quality(
             "gap_resolution",
             _ratio(resolved_gap_count, known_gap_count, empty=1.0),
             f"{resolved_gap_count}/{known_gap_count} known gaps resolved.",
+        ),
+        _score(
+            "final_gap_ledger_consistency",
+            _ratio(
+                len(ledger_consistent_dimensions),
+                len(dimensions),
+                empty=0.0,
+            ),
+            f"{len(ledger_consistent_dimensions)}/{len(dimensions)} dimensions "
+            "have a complete final audit with no closed Gap blockers.",
         ),
         _score(
             "gap_direct_evidence_coverage",
