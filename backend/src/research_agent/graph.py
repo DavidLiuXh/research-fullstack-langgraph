@@ -10,6 +10,7 @@ import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 # The CLI executes this file by path, so the src-layout package root is not
@@ -127,6 +128,226 @@ def _source_rank_key(source: Mapping[str, Any]) -> tuple:
         bool(source.get("is_authoritative_source")),
         float(source.get("evidence_score", 0)),
     )
+
+
+_WIRE_SERVICE_PATTERN = re.compile(
+    r"(?:^|[\n(])\s*(?:xinhua|reuters|associated press|"
+    r"agence\s+france-presse|afp)\b|"
+    r"\b(?:source|reported by|according to|via)\s*:?-?\s*(?:xinhua|reuters|"
+    r"associated press|agence\s+france-presse|afp)\b|"
+    r"\b(?:xinhua|reuters|associated press|afp)\s+(?:reports?|reported)\b",
+    re.IGNORECASE,
+)
+_SCOPE_STOPWORDS = {
+    "about",
+    "after",
+    "against",
+    "analysis",
+    "answer",
+    "answers",
+    "authoritative",
+    "before",
+    "beyond",
+    "china",
+    "chinas",
+    "current",
+    "direct",
+    "evidence",
+    "including",
+    "market",
+    "official",
+    "potential",
+    "recent",
+    "report",
+    "research",
+    "result",
+    "since",
+    "source",
+    "sources",
+    "statement",
+    "study",
+    "what",
+    "which",
+    "with",
+}
+
+
+def _apply_source_provenance_guardrails(
+    source: Mapping[str, Any],
+    *,
+    source_type: str,
+    authority: float,
+    primary: bool,
+    repost: bool,
+    rejection_reasons: list[str],
+) -> tuple[str, float, bool, bool, list[str]]:
+    """Correct source-type claims contradicted by deterministic provenance."""
+    parsed = urlsplit(str(source.get("canonical_url") or source.get("url", "")))
+    domain = parsed.netloc.casefold()
+    path = parsed.path.casefold()
+    attribution_text = " ".join(
+        [str(source.get("title", "")), str(source.get("content", ""))[:500]]
+    )
+    attributed_to_wire_service = bool(_WIRE_SERVICE_PATTERN.search(attribution_text))
+    chinese_government_domain = domain == "gov.cn" or domain.endswith(".gov.cn")
+    government_news_page = chinese_government_domain and "/news/" in path
+    reasons = list(rejection_reasons)
+    if attributed_to_wire_service and (
+        source_type == "government" or chinese_government_domain
+    ):
+        source_type = "major_media"
+        authority = min(authority, 0.75)
+        primary = False
+        repost = True
+        reasons.append(
+            "The page is attributed to a wire service; an official host does not "
+            "make republished reporting a government primary source."
+        )
+    elif government_news_page and primary:
+        primary = False
+        reasons.append(
+            "A government-portal news page is secondary reporting unless its "
+            "content identifies an original policy, regulation, or dataset."
+        )
+    return source_type, authority, primary, repost, list(dict.fromkeys(reasons))
+
+
+def _scope_terms(value: str) -> set[str]:
+    """Return compact English terms useful for conservative scope matching."""
+    return {
+        token
+        for token in re.findall(r"[a-z][a-z0-9-]{3,}", value.casefold())
+        if token not in _SCOPE_STOPWORDS and not token.isdigit()
+    }
+
+
+def _claim_scope_rejection_reasons(
+    gap: Mapping[str, Any],
+    claim: str,
+    evidence: list[dict],
+    source_by_id: Mapping[str, Mapping[str, Any]] | None = None,
+) -> list[str]:
+    """Reject quote-grounded claims outside a gap's explicit topic or time scope."""
+    requirement = " ".join(
+        [str(gap.get("question", "")), str(gap.get("expected_evidence", ""))]
+    )
+    evidence_text = " ".join(
+        [claim, *(str(item.get("quote", "")) for item in evidence)]
+    )
+    reasons = []
+    required_terms = _scope_terms(requirement)
+    evidence_terms = _scope_terms(evidence_text)
+    if len(required_terms) >= 3 and not required_terms.intersection(evidence_terms):
+        reasons.append("semantic_scope_mismatch")
+
+    after_years = [
+        int(year)
+        for pattern in (
+            r"\b(?:after|beyond|post)[-\s]*(20\d{2})\b",
+            r"(20\d{2})\s*(?:之后|以后)",
+        )
+        for year in re.findall(pattern, requirement, flags=re.IGNORECASE)
+    ]
+    since_years = [
+        int(year)
+        for pattern in (
+            r"\b(?:since|from)[-\s]*(20\d{2})\b",
+            r"(20\d{2})\s*(?:以来|起)",
+        )
+        for year in re.findall(pattern, requirement, flags=re.IGNORECASE)
+    ]
+    content_years = {int(year) for year in re.findall(r"\b20\d{2}\b", evidence_text)}
+    publication_years = set()
+    if source_by_id:
+        publication_years.update(
+            int(year)
+            for item in evidence
+            for source in [source_by_id.get(str(item.get("source_id", "")), {})]
+            for year in re.findall(
+                r"\b20\d{2}\b", str(source.get("published_date", ""))
+            )
+        )
+    # A publication date after a boundary does not prove that the quoted claim
+    # itself covers that future horizon. It may only support "since/from" recency.
+    if after_years and not any(year > max(after_years) for year in content_years):
+        reasons.append("temporal_scope_mismatch")
+    elif since_years and not any(
+        year >= max(since_years) for year in content_years | publication_years
+    ):
+        reasons.append("temporal_scope_mismatch")
+    return reasons
+
+
+def _validate_gap_ledger_claim(
+    claim: Mapping[str, Any],
+    gap: Mapping[str, Any],
+    selected_by_id: Mapping[str, Mapping[str, Any]],
+    configurable: Configuration,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Revalidate one Gap claim against accepted evidence and explicit scope."""
+    gap_id = str(gap["gap_id"])
+    supporting_evidence = []
+    for evidence in claim.get("supporting_evidence", []):
+        if not isinstance(evidence, Mapping):
+            continue
+        source_id = str(evidence.get("source_id", ""))
+        source = selected_by_id.get(source_id)
+        if not source or not (
+            gap_id == source.get("gap_id")
+            or gap_id in (source.get("gap_ids", []) or [])
+        ):
+            continue
+        located = locate_evidence_quote(
+            str(source.get("content", "")),
+            str(evidence.get("quote", "")),
+            min_chars=configurable.min_evidence_quote_chars,
+        )
+        if located:
+            quote, locator = located
+            supporting_evidence.append(
+                {"source_id": source_id, "quote": quote, "locator": locator}
+            )
+    if not supporting_evidence:
+        return None, ["missing_verified_quote"]
+    scope_rejections = _claim_scope_rejection_reasons(
+        gap,
+        str(claim.get("claim", "")),
+        supporting_evidence,
+        selected_by_id,
+    )
+    if scope_rejections:
+        return None, scope_rejections
+    counter_evidence = []
+    for evidence in claim.get("contradicting_evidence", []):
+        if not isinstance(evidence, Mapping):
+            continue
+        source_id = str(evidence.get("source_id", ""))
+        source = selected_by_id.get(source_id)
+        if not source:
+            continue
+        located = locate_evidence_quote(
+            str(source.get("content", "")),
+            str(evidence.get("quote", "")),
+            min_chars=configurable.min_evidence_quote_chars,
+        )
+        if located:
+            quote, locator = located
+            counter_evidence.append(
+                {"source_id": source_id, "quote": quote, "locator": locator}
+            )
+    normalized = {
+        **claim,
+        "gap_ids": [gap_id],
+        "supporting_source_ids": list(
+            dict.fromkeys(item["source_id"] for item in supporting_evidence)
+        ),
+        "supporting_evidence": supporting_evidence,
+        "contradicting_source_ids": list(
+            dict.fromkeys(item["source_id"] for item in counter_evidence)
+        ),
+        "contradicting_evidence": counter_evidence,
+    }
+    return normalized, []
 
 
 def emit_research_event(event_type: str, **data):
@@ -354,6 +575,7 @@ def _operational_gap(gap: Mapping[str, Any], *, origin: str) -> dict[str, Any]:
             "no_progress_count": 0,
             "strategy_level": 0,
             "matched_source_ids": [],
+            "retained_evidence_source_ids": [],
             "supported_claims": [],
             "closure_reason": "",
             "remaining_evidence": "",
@@ -432,6 +654,7 @@ def plan_initial_gaps(state: DimensionState, config: RunnableConfig):
         "is_sufficient": False,
         "resolved_gap_ids": [],
         "gap_source_coverage_ids": [],
+        "gap_claim_ledger": [],
     }
 
 
@@ -782,12 +1005,83 @@ def web_research(state: WebSearchState, config: RunnableConfig) -> DimensionStat
 def evaluate_sources(state: DimensionState, config: RunnableConfig):
     """Normalize, assess, and select evidence before reflection."""
     configurable = Configuration.from_runnable_config(config)
+    resolved_gap_ids = set(state.get("resolved_gap_ids", []))
+    protected_gap_ids_by_source: dict[str, set[str]] = {}
+    for gap_id, gap in state.get("gap_registry", {}).items():
+        protected_source_ids = set(gap.get("retained_evidence_source_ids", []))
+        if gap.get("status") == "closed" or gap_id in resolved_gap_ids:
+            # Rolling checkpoints created before retained evidence was recorded.
+            protected_source_ids.update(gap.get("matched_source_ids", []))
+        for source_id in protected_source_ids:
+            protected_gap_ids_by_source.setdefault(source_id, set()).add(gap_id)
+    previous_accepted_by_id = {
+        source["source_id"]: source
+        for source in state.get("selected_sources", [])
+        if source.get("quality_status") == "accepted"
+    }
+    protected_sources = {
+        source_id: previous_accepted_by_id[source_id]
+        for source_id in protected_gap_ids_by_source
+        if source_id in previous_accepted_by_id
+    }
     all_candidates = deduplicate_sources(state.get("sources_gathered", []))
-    candidates = sorted(
-        all_candidates,
+    candidate_by_url = {
+        source.get("canonical_url") or source.get("url", ""): source
+        for source in all_candidates
+    }
+    protected_urls = {
+        source.get("canonical_url") or source.get("url", "")
+        for source in protected_sources.values()
+    }
+    all_candidates = [
+        source
+        for source in all_candidates
+        if (source.get("canonical_url") or source.get("url", "")) not in protected_urls
+    ]
+    for source_id, protected in protected_sources.items():
+        canonical_url = protected.get("canonical_url") or protected.get("url", "")
+        candidate = candidate_by_url.get(canonical_url, {})
+        all_candidates.append(
+            {
+                **candidate,
+                **protected,
+                "gap_ids": list(
+                    dict.fromkeys(
+                        [
+                            *candidate.get("gap_ids", []),
+                            *protected.get("gap_ids", []),
+                        ]
+                    )
+                ),
+                "requested_source_types": sorted(
+                    set(candidate.get("requested_source_types", []))
+                    | set(protected.get("requested_source_types", []))
+                ),
+                "protected_gap_ids": sorted(protected_gap_ids_by_source[source_id]),
+            }
+        )
+    protected_candidates = [
+        source for source in all_candidates if source["source_id"] in protected_sources
+    ]
+    ordinary_candidates = sorted(
+        (
+            source
+            for source in all_candidates
+            if source["source_id"] not in protected_sources
+        ),
         key=lambda source: normalize_search_score(source.get("score"), default=0),
         reverse=True,
-    )[: configurable.max_source_candidates_per_dimension]
+    )
+    # Candidate and selection limits are soft budgets for new evidence. Evidence
+    # already used to close a gap is never truncated by a later research pass.
+    ordinary_budget = max(
+        configurable.max_source_candidates_per_dimension - len(protected_candidates),
+        0,
+    )
+    candidates = [
+        *protected_candidates,
+        *ordinary_candidates[:ordinary_budget],
+    ]
     if not candidates:
         emit_research_event(
             "sources_evaluated",
@@ -865,6 +1159,16 @@ def evaluate_sources(state: DimensionState, config: RunnableConfig):
             source_type = assessment.source_type
             supported_topics = assessment.supported_topics
             rejection_reasons = assessment.rejection_reasons
+        source_type, authority, primary, repost, rejection_reasons = (
+            _apply_source_provenance_guardrails(
+                source,
+                source_type=source_type,
+                authority=authority,
+                primary=primary,
+                repost=repost,
+                rejection_reasons=rejection_reasons,
+            )
+        )
         if source_type == "unknown":
             authority = min(authority, 0.4)
             primary = False
@@ -917,11 +1221,41 @@ def evaluate_sources(state: DimensionState, config: RunnableConfig):
                 "is_authoritative_source": is_authoritative_source,
             }
         )
+    evaluated_by_id = {source["source_id"]: source for source in evaluated}
+    for source_id, protected in protected_sources.items():
+        current = evaluated_by_id.get(source_id)
+        if current is None:
+            continue
+        stable = {
+            **current,
+            **protected,
+            "gap_ids": list(
+                dict.fromkeys(
+                    [*current.get("gap_ids", []), *protected.get("gap_ids", [])]
+                )
+            ),
+            "protected_gap_ids": sorted(protected_gap_ids_by_source[source_id]),
+            "quality_status": "accepted",
+            "rejection_reasons": list(protected.get("rejection_reasons", [])),
+        }
+        current.clear()
+        current.update(stable)
     domain_counts: dict[str, int] = {}
-    for source in sorted(evaluated, key=_source_rank_key, reverse=True):
+    domain_ranked = sorted(
+        evaluated,
+        key=lambda source: (
+            source["source_id"] in protected_sources,
+            *_source_rank_key(source),
+        ),
+        reverse=True,
+    )
+    for source in domain_ranked:
         if source["quality_status"] == "rejected":
             continue
         domain = source.get("domain", "")
+        if source["source_id"] in protected_sources:
+            domain_counts[domain] = domain_counts.get(domain, 0) + 1
+            continue
         if domain_counts.get(domain, 0) >= configurable.max_sources_per_domain:
             source["quality_status"] = "rejected"
             source["rejection_reasons"] = [
@@ -930,16 +1264,26 @@ def evaluate_sources(state: DimensionState, config: RunnableConfig):
             ]
             continue
         domain_counts[domain] = domain_counts.get(domain, 0) + 1
+    protected_selected = [
+        source
+        for source in evaluated
+        if source["source_id"] in protected_sources
+        and source["quality_status"] in {"accepted", "supplementary"}
+    ]
     quality_ranked = sorted(
         (
             source
             for source in evaluated
+            if source["source_id"] not in protected_sources
             if source["quality_status"] in {"accepted", "supplementary"}
         ),
         key=_source_rank_key,
         reverse=True,
     )
-    for source in quality_ranked[configurable.max_selected_sources_per_dimension :]:
+    remaining_budget = max(
+        configurable.max_selected_sources_per_dimension - len(protected_selected), 0
+    )
+    for source in quality_ranked[remaining_budget:]:
         source["quality_status"] = "rejected"
         source["rejection_reasons"] = [
             *source["rejection_reasons"],
@@ -971,6 +1315,14 @@ def evaluate_sources(state: DimensionState, config: RunnableConfig):
             source["quality_status"] == "supplementary" for source in evaluated
         ),
         rejected_count=len(rejected),
+        protected_source_count=len(protected_selected),
+        protected_gap_count=len(
+            {
+                gap_id
+                for gap_ids in protected_gap_ids_by_source.values()
+                for gap_id in gap_ids
+            }
+        ),
     )
     return {
         "evaluated_sources": evaluated,
@@ -1004,6 +1356,8 @@ def assess_gap_evidence(state: DimensionState, config: RunnableConfig):
     ]
     assessment_status = "completed"
     assessment_failure_count = 0
+    verified_claims: list[dict[str, Any]] = []
+    scope_rejection_reasons: list[str] = []
     if gap["gap_id"] in {
         "quality-accepted-sources",
         "quality-authoritative-source",
@@ -1058,47 +1412,115 @@ def assess_gap_evidence(state: DimensionState, config: RunnableConfig):
             assessment_result = structured_model.invoke(prompt + retry_instruction)
             if not isinstance(assessment_result, ClaimExtraction):
                 raise TypeError("Gap evidence assessment returned an unexpected type")
-            matched_source_ids = []
-            contradictory_source_ids = []
-            supported_claims = []
+            accepted_claims = []
+            rejected_scopes = []
             for claim in assessment_result.claims[:6]:
                 if claim.gap_ids and gap["gap_id"] not in claim.gap_ids:
                     continue
-                verified_supporting_ids = []
+                supporting_evidence = []
                 for evidence in claim.evidence:
                     source = candidate_by_id.get(evidence.source_id)
-                    if source and locate_evidence_quote(
-                        source.get("content", ""),
-                        evidence.quote,
-                        min_chars=configurable.min_evidence_quote_chars,
-                    ):
-                        verified_supporting_ids.append(evidence.source_id)
-                if not verified_supporting_ids:
+                    located = (
+                        locate_evidence_quote(
+                            source.get("content", ""),
+                            evidence.quote,
+                            min_chars=configurable.min_evidence_quote_chars,
+                        )
+                        if source
+                        else None
+                    )
+                    if located:
+                        quote, locator = located
+                        supporting_evidence.append(
+                            {
+                                "source_id": evidence.source_id,
+                                "quote": quote,
+                                "locator": locator,
+                            }
+                        )
+                if not supporting_evidence:
                     continue
-                matched_source_ids.extend(verified_supporting_ids)
-                supported_claims.append(claim.claim)
+                rejected = _claim_scope_rejection_reasons(
+                    gap, claim.claim, supporting_evidence, candidate_by_id
+                )
+                if rejected:
+                    rejected_scopes.extend(rejected)
+                    continue
+                counter_evidence = []
                 for evidence in claim.counter_evidence:
                     source = candidate_by_id.get(evidence.source_id)
-                    if source and locate_evidence_quote(
-                        source.get("content", ""),
-                        evidence.quote,
-                        min_chars=configurable.min_evidence_quote_chars,
-                    ):
-                        contradictory_source_ids.append(evidence.source_id)
-            matched_source_ids = list(dict.fromkeys(matched_source_ids))
-            return GapEvidenceAssessment(
+                    located = (
+                        locate_evidence_quote(
+                            source.get("content", ""),
+                            evidence.quote,
+                            min_chars=configurable.min_evidence_quote_chars,
+                        )
+                        if source
+                        else None
+                    )
+                    if located:
+                        quote, locator = located
+                        counter_evidence.append(
+                            {
+                                "source_id": evidence.source_id,
+                                "quote": quote,
+                                "locator": locator,
+                            }
+                        )
+                accepted_claims.append(
+                    {
+                        "claim": claim.claim,
+                        "gap_ids": [gap["gap_id"]],
+                        "supporting_source_ids": list(
+                            dict.fromkeys(
+                                item["source_id"] for item in supporting_evidence
+                            )
+                        ),
+                        "supporting_evidence": supporting_evidence,
+                        "contradicting_source_ids": list(
+                            dict.fromkeys(
+                                item["source_id"] for item in counter_evidence
+                            )
+                        ),
+                        "contradicting_evidence": counter_evidence,
+                        "confidence": claim.confidence,
+                        "uncertainty_reason": claim.uncertainty,
+                    }
+                )
+            matched_source_ids = list(
+                dict.fromkeys(
+                    source_id
+                    for claim in accepted_claims
+                    for source_id in claim["supporting_source_ids"]
+                )
+            )
+            contradictory_source_ids = list(
+                dict.fromkeys(
+                    source_id
+                    for claim in accepted_claims
+                    for source_id in claim["contradicting_source_ids"]
+                )
+            )
+            assessment = GapEvidenceAssessment(
                 gap_id=gap["gap_id"],
-                directly_answers_gap=bool(matched_source_ids),
+                directly_answers_gap=bool(accepted_claims),
                 matched_source_ids=matched_source_ids,
-                supported_claims=list(dict.fromkeys(supported_claims)),
-                contradictory_source_ids=list(dict.fromkeys(contradictory_source_ids)),
+                supported_claims=list(
+                    dict.fromkeys(claim["claim"] for claim in accepted_claims)
+                ),
+                contradictory_source_ids=contradictory_source_ids,
                 remaining_evidence=(
-                    "" if matched_source_ids else assessment_result.summary
+                    ""
+                    if accepted_claims
+                    else gap.get("expected_evidence", "")
+                    if rejected_scopes
+                    else assessment_result.summary or gap.get("expected_evidence", "")
                 ),
             )
+            return assessment, accepted_claims, list(dict.fromkeys(rejected_scopes))
 
         try:
-            result = invoke_assessment()
+            result, verified_claims, scope_rejection_reasons = invoke_assessment()
         except (
             AttributeError,
             LengthFinishReasonError,
@@ -1107,7 +1529,9 @@ def assess_gap_evidence(state: DimensionState, config: RunnableConfig):
             ValueError,
         ) as error:
             try:
-                result = invoke_assessment(retry=True)
+                result, verified_claims, scope_rejection_reasons = invoke_assessment(
+                    retry=True
+                )
                 assessment_status = "completed_after_retry"
             except (
                 AttributeError,
@@ -1211,7 +1635,10 @@ def assess_gap_evidence(state: DimensionState, config: RunnableConfig):
         "has_progress": has_progress,
         "assessment_status": assessment_status,
         "candidate_source_count": len(accepted),
+        "scope_rejection_reasons": scope_rejection_reasons,
     }
+    if assessment_status != "deterministic_quality_check":
+        assessment["verified_claims"] = verified_claims
     emit_research_event(
         "gap_evidence_assessed",
         research_run_id=state["research_run_id"],
@@ -1312,27 +1739,78 @@ def update_gap_status(state: DimensionState, config: RunnableConfig):
         if source.get("quality_status") == "accepted"
     }
 
-    matched_ids = list(
-        dict.fromkeys(
-            [
-                *gap.get("matched_source_ids", []),
-                *assessment.get("matched_source_ids", []),
-            ]
+    ledger = list(state.get("gap_claim_ledger", []))
+    if "verified_claims" in assessment:
+        retained_other_gap_claims = [
+            claim for claim in ledger if gap_id not in claim.get("gap_ids", [])
+        ]
+        current_gap_claims = []
+        scope_rejection_reasons = list(assessment.get("scope_rejection_reasons", []))
+        seen_claims = set()
+        for claim in [
+            *(claim for claim in ledger if gap_id in claim.get("gap_ids", [])),
+            *assessment.get("verified_claims", []),
+        ]:
+            validated, rejected = _validate_gap_ledger_claim(
+                claim, gap, selected_by_id, configurable
+            )
+            scope_rejection_reasons.extend(rejected)
+            if validated is None:
+                continue
+            claim_key = (
+                re.sub(r"\s+", " ", validated["claim"]).strip().casefold(),
+                tuple(validated["supporting_source_ids"]),
+            )
+            if claim_key in seen_claims:
+                continue
+            seen_claims.add(claim_key)
+            current_gap_claims.append(validated)
+        ledger = [*retained_other_gap_claims, *current_gap_claims]
+        matched_ids = list(
+            dict.fromkeys(
+                source_id
+                for claim in current_gap_claims
+                for source_id in claim["supporting_source_ids"]
+            )
         )
-    )
-    supported_claims = list(
-        dict.fromkeys(
-            [
-                *gap.get("supported_claims", []),
-                *assessment.get("supported_claims", []),
-            ]
+        supported_claims = list(
+            dict.fromkeys(claim["claim"] for claim in current_gap_claims)
         )
-    )
-    # Every assessment sees the complete provenance-constrained evidence set for
-    # this gap, so the latest result supersedes earlier contradiction candidates.
-    contradictory_ids = list(
-        dict.fromkeys(assessment.get("contradictory_source_ids", []))
-    )
+        contradictory_ids = list(
+            dict.fromkeys(
+                source_id
+                for claim in current_gap_claims
+                for source_id in claim["contradicting_source_ids"]
+            )
+        )
+        direct_evidence = bool(current_gap_claims)
+    else:
+        # Compatibility for deterministic quality gaps and rolling checkpoints
+        # created before the structured Gap claim ledger existed.
+        matched_ids = list(
+            dict.fromkeys(
+                [
+                    *gap.get("matched_source_ids", []),
+                    *assessment.get("matched_source_ids", []),
+                ]
+            )
+        )
+        supported_claims = list(
+            dict.fromkeys(
+                [
+                    *gap.get("supported_claims", []),
+                    *assessment.get("supported_claims", []),
+                ]
+            )
+        )
+        contradictory_ids = list(
+            dict.fromkeys(assessment.get("contradictory_source_ids", []))
+        )
+        direct_evidence = bool(
+            gap.get("direct_evidence_confirmed")
+            or assessment.get("directly_answers_gap")
+        )
+        scope_rejection_reasons = []
     snapshot = _gap_closure_snapshot(
         gap,
         matched_ids=matched_ids,
@@ -1340,10 +1818,7 @@ def update_gap_status(state: DimensionState, config: RunnableConfig):
         contradictory_ids=contradictory_ids,
         selected_by_id=selected_by_id,
         configurable=configurable,
-        direct_evidence_confirmed=bool(
-            gap.get("direct_evidence_confirmed")
-            or assessment.get("directly_answers_gap")
-        ),
+        direct_evidence_confirmed=direct_evidence,
     )
     requested_type_satisfied = snapshot["requested_type_satisfied"]
     independent_domains = snapshot["independent_domains"]
@@ -1396,6 +1871,7 @@ def update_gap_status(state: DimensionState, config: RunnableConfig):
             "attempt_count": attempt_count,
             "no_progress_count": no_progress_count,
             "matched_source_ids": matched_ids,
+            "retained_evidence_source_ids": matched_ids,
             "supported_claims": supported_claims,
             "contradictory_source_ids": contradictory_ids,
             "direct_evidence_confirmed": direct_evidence_confirmed,
@@ -1406,6 +1882,10 @@ def update_gap_status(state: DimensionState, config: RunnableConfig):
             "closure_blockers": closure_blockers,
             "required_independent_source_count": required_independent,
             "assessment_status": assessment.get("assessment_status", "unknown"),
+            "verified_claim_count": len(
+                [claim for claim in ledger if gap_id in claim.get("gap_ids", [])]
+            ),
+            "scope_rejection_reasons": list(dict.fromkeys(scope_rejection_reasons)),
         }
     )
     registry[gap_id] = gap
@@ -1453,6 +1933,7 @@ def update_gap_status(state: DimensionState, config: RunnableConfig):
         "research_loop_count": state.get("research_loop_count", 0) + 1,
         "resolved_gap_ids": sorted(resolved_ids),
         "gap_source_coverage_ids": sorted(coverage_ids),
+        "gap_claim_ledger": ledger,
         "evidence_gain_history": [gain],
     }
 
@@ -1492,6 +1973,21 @@ def replan_search(state: DimensionState, config: RunnableConfig):
     guidance_parts = [
         blocker_guidance[blocker] for blocker in blockers if blocker in blocker_guidance
     ]
+    scope_guidance = {
+        "temporal_scope_mismatch": (
+            "Include the exact required year or horizon in every query and reject "
+            "documents whose quoted facts only cover earlier periods."
+        ),
+        "semantic_scope_mismatch": (
+            "Search the exact unresolved subquestion and its required metric or "
+            "policy instrument, not the broader topic."
+        ),
+    }
+    guidance_parts.extend(
+        scope_guidance[reason]
+        for reason in gap.get("scope_rejection_reasons", [])
+        if reason in scope_guidance
+    )
     if not guidance_parts:
         guidance_parts = [
             generic_strategies.get(
@@ -1845,6 +2341,10 @@ def merge_gap_registry(state: DimensionState):
                     "no_progress_count": 0,
                     "strategy_level": int(existing.get("strategy_level", 0)) + 1,
                     "matched_source_ids": existing.get("matched_source_ids", []),
+                    "retained_evidence_source_ids": existing.get(
+                        "retained_evidence_source_ids",
+                        existing.get("matched_source_ids", []),
+                    ),
                     "supported_claims": existing.get("supported_claims", []),
                 }
             )
@@ -1948,6 +2448,7 @@ def _reconcile_extracted_claims(
             gap.update(
                 {
                     "matched_source_ids": matched_ids,
+                    "retained_evidence_source_ids": matched_ids,
                     "supported_claims": supported_claims,
                     "direct_evidence_confirmed": True,
                     "requested_source_type_satisfied": snapshot[
@@ -1968,11 +2469,20 @@ def _reconcile_extracted_claims(
                     "evidence satisfied every closure requirement."
                 )
                 resolved_ids.add(gap_id)
+            else:
+                gap["status"] = "partial"
+                gap["closure_reason"] = (
+                    "Claim reconciliation found final-ledger blockers: "
+                    + ", ".join(snapshot["closure_blockers"])
+                )
+                resolved_ids.discard(gap_id)
             if (
                 snapshot["direct_evidence_confirmed"]
                 and snapshot["requested_type_satisfied"]
             ):
                 coverage_ids.add(gap_id)
+            else:
+                coverage_ids.discard(gap_id)
             registry[gap_id] = gap
             reconciled_claim_count += 1
     return {
@@ -2003,6 +2513,27 @@ def extract_claims(state: DimensionState, config: RunnableConfig):
             "claims": [],
             "dimension_summary": "No claim was extracted because no quality-screened evidence was available.",
         }
+    source_by_id = {source["source_id"]: source for source in selected}
+    gap_registry = state.get("gap_registry", {})
+    ledger_claims = []
+    ledger_seen = set()
+    for claim in state.get("gap_claim_ledger", []):
+        for gap_id in claim.get("gap_ids", []):
+            gap = gap_registry.get(gap_id)
+            if not gap:
+                continue
+            validated, _ = _validate_gap_ledger_claim(
+                claim, gap, source_by_id, configurable
+            )
+            if validated is None:
+                continue
+            key = (
+                re.sub(r"\s+", " ", validated["claim"]).strip().casefold(),
+                tuple(validated["supporting_source_ids"]),
+            )
+            if key not in ledger_seen:
+                ledger_seen.add(key)
+                ledger_claims.append(validated)
 
     def build_prompt(sources, content_chars, max_claims):
         return claim_extraction_instructions.format(
@@ -2069,11 +2600,10 @@ def extract_claims(state: DimensionState, config: RunnableConfig):
                 dimension=state["dimension"],
                 error=f"{type(retry_error).__name__}: {retry_error}",
             )
-            return {
-                "claims": [],
-                "dimension_summary": "No claim passed structured evidence extraction.",
-            }
-    source_by_id = {source["source_id"]: source for source in selected}
+            result = ClaimExtraction(
+                claims=[],
+                summary="No additional claim passed structured evidence extraction.",
+            )
     valid_gap_ids = set(state.get("gap_registry", {}))
 
     def validate_extraction(extraction):
@@ -2120,7 +2650,11 @@ def extract_claims(state: DimensionState, config: RunnableConfig):
                     for source_id in supporting_ids
                     if source_id in source_by_id
                 ):
-                    mapped_gap_ids.append(gap_id)
+                    gap = gap_registry[gap_id]
+                    if not _claim_scope_rejection_reasons(
+                        gap, claim.claim, supporting_evidence, source_by_id
+                    ):
+                        mapped_gap_ids.append(gap_id)
             validated_claims.append(
                 {
                     "claim": claim.claim,
@@ -2168,6 +2702,14 @@ def extract_claims(state: DimensionState, config: RunnableConfig):
             claims = list(claims_by_text.values())[
                 : configurable.max_claims_per_dimension
             ]
+    combined_claims = {}
+    for claim in [*ledger_claims, *claims]:
+        key = (
+            re.sub(r"\s+", " ", claim["claim"]).strip().casefold(),
+            tuple(claim.get("supporting_source_ids", [])),
+        )
+        combined_claims.setdefault(key, claim)
+    claims = list(combined_claims.values())[: configurable.max_claims_per_dimension]
     emit_research_event(
         "claims_extracted",
         research_run_id=state["research_run_id"],
@@ -2192,6 +2734,284 @@ def extract_claims(state: DimensionState, config: RunnableConfig):
     }
 
 
+def audit_final_gap_ledger(state: DimensionState, config: RunnableConfig):
+    """Revalidate every gap against the immutable final accepted evidence ledger."""
+    configurable = Configuration.from_runnable_config(config)
+    selected_by_id = {
+        source["source_id"]: source
+        for source in state.get("selected_sources", [])
+        if source.get("quality_status") == "accepted"
+    }
+    claims_by_gap: dict[str, list[dict]] = {}
+    claim_source_ids_by_gap: dict[str, list[str]] = {}
+    rejected_claim_reasons_by_gap: dict[str, list[str]] = {}
+    gap_registry = state.get("gap_registry", {})
+    candidate_claims = [
+        *state.get("gap_claim_ledger", []),
+        *state.get("claims", []),
+    ]
+    for claim in candidate_claims:
+        for gap_id in claim.get("gap_ids", []):
+            gap = gap_registry.get(gap_id)
+            if not gap:
+                continue
+            validated, rejected = _validate_gap_ledger_claim(
+                claim, gap, selected_by_id, configurable
+            )
+            if validated is None:
+                rejected_claim_reasons_by_gap.setdefault(gap_id, []).extend(rejected)
+                continue
+            existing_keys = {
+                (
+                    item.get("claim", "").casefold(),
+                    tuple(item.get("supporting_source_ids", [])),
+                )
+                for item in claims_by_gap.get(gap_id, [])
+            }
+            key = (
+                validated.get("claim", "").casefold(),
+                tuple(validated.get("supporting_source_ids", [])),
+            )
+            if key not in existing_keys:
+                claims_by_gap.setdefault(gap_id, []).append(validated)
+            claim_source_ids_by_gap.setdefault(gap_id, []).extend(
+                validated["supporting_source_ids"]
+            )
+
+    registry = {}
+    prior_resolved_ids = set(state.get("resolved_gap_ids", []))
+    resolved_ids: set[str] = set()
+    coverage_ids: set[str] = set()
+    revoked_gap_ids = []
+    retryable_gap_ids = []
+    removed_source_ids: set[str] = set()
+    for gap_id, original_gap in state.get("gap_registry", {}).items():
+        gap = dict(original_gap)
+        prior_status = gap.get("status", "open")
+        prior_matched_ids = list(dict.fromkeys(gap.get("matched_source_ids", [])))
+        missing_ids = [
+            source_id
+            for source_id in prior_matched_ids
+            if source_id not in selected_by_id
+        ]
+        removed_source_ids.update(missing_ids)
+        if gap_id == "quality-primary-source":
+            matched_ids = [
+                source_id
+                for source_id, source in selected_by_id.items()
+                if source.get("is_primary_source")
+            ]
+        elif gap_id == "quality-authoritative-source":
+            matched_ids = [
+                source_id
+                for source_id, source in selected_by_id.items()
+                if source.get("is_authoritative_source")
+            ]
+        elif gap_id == "quality-accepted-sources":
+            matched_ids = list(selected_by_id)
+        else:
+            matched_ids = list(
+                dict.fromkeys(
+                    [
+                        *(
+                            source_id
+                            for source_id in prior_matched_ids
+                            if source_id in selected_by_id
+                        ),
+                        *claim_source_ids_by_gap.get(gap_id, []),
+                    ]
+                )
+            )
+        final_claims = claims_by_gap.get(gap_id, [])
+        # Only quote-verified claims that still point to accepted final-ledger
+        # evidence may satisfy the final supported-claim requirement. Earlier
+        # model assessments are useful during research but are not immutable
+        # evidence provenance.
+        supported_claims = list(
+            dict.fromkeys(claim.get("claim", "") for claim in final_claims)
+        )
+        supported_claims = [claim for claim in supported_claims if claim]
+        if gap_id.startswith("quality-") and matched_ids:
+            supported_claims = [
+                f"The final ledger has {len(matched_ids)} qualifying accepted source(s)."
+            ]
+        contradictory_ids = list(
+            dict.fromkeys(
+                source_id
+                for source_id in gap.get("contradictory_source_ids", [])
+                if source_id in selected_by_id
+            )
+        )
+        direct_evidence_confirmed = bool(
+            matched_ids
+            if gap_id.startswith("quality-")
+            else claim_source_ids_by_gap.get(gap_id)
+        )
+        snapshot = _gap_closure_snapshot(
+            gap,
+            matched_ids=matched_ids,
+            supported_claims=supported_claims,
+            contradictory_ids=contradictory_ids,
+            selected_by_id=selected_by_id,
+            configurable=configurable,
+            direct_evidence_confirmed=direct_evidence_confirmed,
+        )
+        blockers = snapshot["closure_blockers"]
+        was_resolved = prior_status == "closed" or gap_id in prior_resolved_ids
+        if blockers:
+            if was_resolved:
+                revoked_gap_ids.append(gap_id)
+            exhausted = bool(
+                prior_status == "unresolvable"
+                or int(gap.get("attempt_count", 0))
+                >= int(state.get("max_research_loops", 1))
+                or int(gap.get("no_progress_count", 0))
+                >= configurable.max_gap_no_progress_attempts
+            )
+            status = "unresolvable" if exhausted else "partial"
+            if was_resolved and not exhausted:
+                retryable_gap_ids.append(gap_id)
+            closure_reason = (
+                "Final evidence ledger audit revoked closure because: "
+                + ", ".join(blockers)
+            )
+        else:
+            status = "closed"
+            closure_reason = (
+                "Final accepted evidence ledger satisfies every deterministic "
+                "gap closure requirement."
+            )
+            resolved_ids.add(gap_id)
+        if direct_evidence_confirmed and snapshot["requested_type_satisfied"]:
+            coverage_ids.add(gap_id)
+        gap.update(
+            {
+                "status": status,
+                "matched_source_ids": matched_ids,
+                "retained_evidence_source_ids": (
+                    matched_ids
+                    if gap_id.startswith("quality-")
+                    else list(dict.fromkeys(claim_source_ids_by_gap.get(gap_id, [])))
+                ),
+                "removed_matched_source_ids": missing_ids,
+                "supported_claims": supported_claims,
+                "verified_claim_count": len(final_claims),
+                "contradictory_source_ids": contradictory_ids,
+                "direct_evidence_confirmed": direct_evidence_confirmed,
+                "requested_source_type_satisfied": snapshot["requested_type_satisfied"],
+                "independent_source_count": len(snapshot["independent_domains"]),
+                "required_independent_source_count": snapshot["required_independent"],
+                "closure_blockers": blockers,
+                "closure_reason": closure_reason,
+                "remaining_evidence": (
+                    ""
+                    if not blockers
+                    else gap.get("remaining_evidence")
+                    or gap.get("expected_evidence", "")
+                ),
+                "final_ledger_audit_status": (
+                    "passed"
+                    if not blockers
+                    else "closure_revoked"
+                    if was_resolved
+                    else "blocked"
+                ),
+                "scope_rejection_reasons": list(
+                    dict.fromkeys(
+                        [
+                            *gap.get("scope_rejection_reasons", []),
+                            *rejected_claim_reasons_by_gap.get(gap_id, []),
+                        ]
+                    )
+                ),
+            }
+        )
+        registry[gap_id] = gap
+
+    unresolved = [gap for gap in registry.values() if gap.get("status") != "closed"]
+    unresolved_conflict = any(
+        bool(conflict.get("requires_follow_up"))
+        for conflict in state.get("reflection_assessment", {}).get("contradictions", [])
+        if isinstance(conflict, dict)
+    )
+    is_sufficient = bool(registry and not unresolved and not unresolved_conflict)
+    prior_completion = state.get("completion_status", "partial")
+    if retryable_gap_ids:
+        completion_status = "researching"
+        is_sufficient = False
+    elif prior_completion == "search_unavailable":
+        completion_status = "search_unavailable"
+        is_sufficient = False
+    elif is_sufficient:
+        completion_status = "sufficient"
+    elif prior_completion == "budget_exhausted":
+        completion_status = "budget_exhausted"
+    else:
+        completion_status = "partial"
+    reflection_assessment = dict(state.get("reflection_assessment", {}))
+    reflection_assessment["is_sufficient"] = is_sufficient
+    reflection_assessment["missing_questions"] = unresolved
+    knowledge_gap = "\n".join(
+        f"[{gap['gap_id']}] {gap.get('question', '')}: "
+        f"{gap.get('remaining_evidence') or gap.get('expected_evidence', '')}"
+        for gap in unresolved
+    )
+    final_audit = {
+        "passes": not unresolved,
+        "gap_count": len(registry),
+        "resolved_gap_count": len(resolved_ids),
+        "revoked_gap_ids": sorted(revoked_gap_ids),
+        "retryable_gap_ids": sorted(retryable_gap_ids),
+        "removed_matched_source_ids": sorted(removed_source_ids),
+        "unresolved_gap_ids": sorted(gap["gap_id"] for gap in unresolved),
+    }
+    emit_research_event(
+        "final_gap_ledger_audited",
+        research_run_id=state["research_run_id"],
+        dimension=state["dimension"],
+        audit=final_audit,
+    )
+    result = {
+        "gap_registry": registry,
+        "resolved_gap_ids": sorted(resolved_ids),
+        "gap_source_coverage_ids": sorted(coverage_ids),
+        "is_sufficient": is_sufficient,
+        "completion_status": completion_status,
+        "reflection_assessment": reflection_assessment,
+        "current_knowledge_gap": knowledge_gap,
+        "final_gap_audit": final_audit,
+        "gap_claim_ledger": [
+            claim for claims in claims_by_gap.values() for claim in claims
+        ],
+    }
+    if retryable_gap_ids:
+        priority_rank = {"high": 0, "medium": 1, "low": 2}
+        retry_gap_id = min(
+            retryable_gap_ids,
+            key=lambda item: (
+                priority_rank.get(registry[item].get("priority", "low"), 3),
+                int(registry[item].get("attempt_count", 0)),
+                item,
+            ),
+        )
+        result.update(
+            {
+                "active_gap_id": retry_gap_id,
+                "active_gap": registry[retry_gap_id],
+                "gap_processing_complete": False,
+                "gap_route": "final_audit_retry",
+            }
+        )
+    return result
+
+
+def route_final_gap_audit(state: DimensionState):
+    """Retry an audit-revoked Gap while its bounded search budget remains."""
+    if state.get("final_gap_audit", {}).get("retryable_gap_ids"):
+        return "replan_search"
+    return END
+
+
 dimension_builder = StateGraph(DimensionState, input_schema=DimensionInput)
 dimension_builder.add_node("plan_initial_gaps", plan_initial_gaps)
 dimension_builder.add_node("select_next_gap", select_next_gap)
@@ -2204,6 +3024,7 @@ dimension_builder.add_node("replan_search", replan_search)
 dimension_builder.add_node("dimension_reflection", dimension_reflection)
 dimension_builder.add_node("merge_gap_registry", merge_gap_registry)
 dimension_builder.add_node("extract_claims", extract_claims)
+dimension_builder.add_node("audit_final_gap_ledger", audit_final_gap_ledger)
 dimension_builder.add_edge(START, "plan_initial_gaps")
 dimension_builder.add_edge("plan_initial_gaps", "select_next_gap")
 dimension_builder.add_conditional_edges(
@@ -2229,7 +3050,12 @@ dimension_builder.add_conditional_edges(
     ["merge_gap_registry", "extract_claims"],
 )
 dimension_builder.add_edge("merge_gap_registry", "select_next_gap")
-dimension_builder.add_edge("extract_claims", END)
+dimension_builder.add_edge("extract_claims", "audit_final_gap_ledger")
+dimension_builder.add_conditional_edges(
+    "audit_final_gap_ledger",
+    route_final_gap_audit,
+    ["replan_search", END],
+)
 dimension_subgraph = dimension_builder.compile(name="dimension-research-subgraph")
 
 
@@ -2327,6 +3153,11 @@ def research_dimension(state: DimensionInput, config: RunnableConfig):
                 "closure_reason": gap.get("closure_reason", ""),
                 "remaining_evidence": gap.get("remaining_evidence", ""),
                 "assessment_status": gap.get("assessment_status", "not_assessed"),
+                "verified_claim_count": int(gap.get("verified_claim_count", 0)),
+                "scope_rejection_reasons": gap.get("scope_rejection_reasons", []),
+                "final_ledger_audit_status": gap.get(
+                    "final_ledger_audit_status", "not_audited"
+                ),
                 "attempt_count": int(gap.get("attempt_count", 0)),
                 "no_progress_count": int(gap.get("no_progress_count", 0)),
                 "strategy_level": int(gap.get("strategy_level", 0)),
@@ -2342,6 +3173,9 @@ def research_dimension(state: DimensionInput, config: RunnableConfig):
                     gap.get("required_independent_source_count", 1)
                 ),
                 "matched_source_ids": matched_source_ids,
+                "retained_evidence_source_ids": gap.get(
+                    "retained_evidence_source_ids", []
+                ),
                 "matched_source_types": matched_source_types,
                 "matched_sources": matched_sources,
                 "search_strategy": gap.get("search_strategy", []),
@@ -2351,6 +3185,7 @@ def research_dimension(state: DimensionInput, config: RunnableConfig):
                     for source_id in matched_source_ids
                     if source_id not in accepted_by_id
                 ],
+                "removed_matched_source_ids": gap.get("removed_matched_source_ids", []),
             }
         )
     dimension_result = {
@@ -2418,6 +3253,7 @@ def research_dimension(state: DimensionInput, config: RunnableConfig):
             for gain in result.get("evidence_gain_history", [])
         ),
         "gap_diagnostics": gap_diagnostics,
+        "final_gap_audit": result.get("final_gap_audit", {}),
     }
     emit_research_event(
         "dimension_completed",

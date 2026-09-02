@@ -41,6 +41,7 @@ class ResearchSource(TypedDict):
     quality_status: NotRequired[str]
     gap_id: NotRequired[str]
     gap_ids: NotRequired[list[str]]
+    protected_gap_ids: NotRequired[list[str]]
     requested_source_types: NotRequired[list[str]]
     expected_evidence: NotRequired[str]
     matches_requested_source_type: NotRequired[bool]
@@ -97,6 +98,7 @@ class DimensionResult(TypedDict):
     gap_assessment_failure_count: int
     no_gain_loop_count: int
     gap_diagnostics: list[dict]
+    final_gap_audit: dict
 
 
 class OverallState(TypedDict):
@@ -171,8 +173,10 @@ class DimensionState(TypedDict):
     gap_source_coverage_ids: list[str]
     completion_status: str
     claims: list[EvidenceClaim]
+    gap_claim_ledger: NotRequired[list[EvidenceClaim]]
     dimension_summary: str
     gap_assessment_failure_count: Annotated[int, operator.add]
+    final_gap_audit: NotRequired[dict]
 
 
 class DimensionInput(TypedDict):

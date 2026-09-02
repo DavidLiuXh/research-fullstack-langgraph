@@ -160,6 +160,9 @@ Requirements:
 - Use only source IDs present below.
 - Emit a claim only when a short verbatim quote from the source content directly
   supplies the gap's expected evidence; search-query association is not enough.
+- The quote must satisfy every explicit time horizon, geography, population, and
+  policy or metric scope in the active gap. For example, a 2024 plan does not answer
+  a question about changes after 2026 unless the quote covers that later horizon.
 - Candidate evidence is limited to sources discovered for this gap or evidence
   already matched to it. Use this provenance as context, but still require direct
   semantic support.
@@ -197,6 +200,11 @@ Requirements:
 - Check whether each source satisfies the source types requested by its originating gap.
 - Preserve credible counterevidence and opposing viewpoints.
 - Distinguish first-party evidence, independent evidence, reporting, opinion, aggregation, and reposts.
+- An official domain does not make every hosted page a primary source. Treat a
+  government news page attributed to Xinhua, Reuters, AP, AFP, or another publisher
+  as republished media, not an original government document.
+- Judge relevance against the originating gap's expected evidence, including its
+  explicit geography and time horizon; broad topical overlap is insufficient.
 - Use only source IDs present below and assess every source exactly once.
 - Scores must be between 0 and 1.
 - Return valid JSON with exactly one top-level key, "assessments".

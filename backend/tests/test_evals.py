@@ -59,6 +59,7 @@ def test_deterministic_evaluator_scores_valid_evidence_and_trajectory():
         "gap_status_updated",
         "reflection_completed",
         "claims_extracted",
+        "final_gap_ledger_audited",
         "report_evidence_prepared",
         "claim_conflicts_detected",
         "drafting_report",
@@ -127,6 +128,21 @@ def test_deterministic_evaluator_scores_valid_evidence_and_trajectory():
                 "independent_source_gap_count": 1,
                 "gap_assessment_failure_count": 0,
                 "completion_status": "sufficient",
+                "gap_diagnostics": [
+                    {
+                        "gap_id": "gap-one",
+                        "status": "closed",
+                        "closure_blockers": [],
+                    }
+                ],
+                "final_gap_audit": {
+                    "passes": True,
+                    "gap_count": 1,
+                    "resolved_gap_count": 1,
+                    "revoked_gap_ids": [],
+                    "removed_matched_source_ids": [],
+                    "unresolved_gap_ids": [],
+                },
                 "claims": [
                     {
                         "supporting_source_ids": ["S1"],
@@ -403,6 +419,37 @@ def test_groundedness_evaluator_filters_invalid_indexes(monkeypatch):
     assert result["score"] == 0.5
 
 
+def test_final_gap_ledger_consistency_rejects_closed_gap_with_blockers():
+    scores = _scores_by_key(
+        evaluate_deterministic_quality(
+            {},
+            {
+                "dimension_results": [
+                    {
+                        "known_gap_count": 1,
+                        "resolved_gap_count": 1,
+                        "gap_diagnostics": [
+                            {
+                                "gap_id": "gap-one",
+                                "status": "closed",
+                                "closure_blockers": [
+                                    "insufficient_independent_sources"
+                                ],
+                            }
+                        ],
+                        "final_gap_audit": {
+                            "gap_count": 1,
+                            "resolved_gap_count": 1,
+                        },
+                    }
+                ]
+            },
+        )
+    )
+
+    assert scores["final_gap_ledger_consistency"] == 0
+
+
 def test_evaluate_example_retains_judge_failure_and_deterministic_scores():
     class FakeTarget:
         async def __call__(self, inputs):
@@ -543,7 +590,7 @@ def test_markdown_report_renders_gap_diagnostics():
     assert "#### Gap Diagnostics" in markdown
     assert "Market \\| Scope" in markdown
     assert "missing_requested_source_type" in markdown
-    assert "direct=True; claims=1; requested_type=False" in markdown
+    assert "direct=True; claims=1; verified_claims=0; requested_type=False" in markdown
     assert "S1:news:example.com" in markdown
 
 

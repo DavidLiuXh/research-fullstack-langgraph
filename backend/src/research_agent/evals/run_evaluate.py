@@ -282,12 +282,16 @@ def render_markdown(report: dict[str, Any]) -> str:
                 evidence_checks = (
                     f"direct={bool(diagnostic.get('direct_evidence_confirmed'))}; "
                     f"claims={int(diagnostic.get('supported_claim_count', 0))}; "
+                    "verified_claims="
+                    f"{int(diagnostic.get('verified_claim_count', 0))}; "
                     "requested_type="
                     f"{bool(diagnostic.get('requested_source_type_satisfied'))}; "
                     "independent="
                     f"{int(diagnostic.get('independent_source_count', 0))}/"
                     f"{int(diagnostic.get('required_independent_source_count', 1))}; "
-                    f"assessment={diagnostic.get('assessment_status', 'unknown')}"
+                    f"assessment={diagnostic.get('assessment_status', 'unknown')}; "
+                    "scope_rejections="
+                    f"{diagnostic.get('scope_rejection_reasons', [])}"
                 )
                 lines.append(
                     "| "
