@@ -219,6 +219,7 @@ def evaluate_deterministic_quality(
         "final_gap_ledger_audited",
         "report_evidence_prepared",
         "claim_conflicts_detected",
+        "report_plan_created",
         "drafting_report",
         "report_audit_completed",
         "report_consistency_audited",
@@ -233,6 +234,28 @@ def evaluate_deterministic_quality(
     )
     revision_count = int(outputs.get("report_revision_count", 0))
     max_revisions = int(outputs.get("max_report_revisions", 0))
+    draft = str(outputs.get("report_draft", ""))
+    body_lines = [
+        line.strip()
+        for line in draft.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    bullet_lines = [
+        line
+        for line in body_lines
+        if re.match(r"^(?:[-*+] |\d+[.)]\s+)", line)
+    ]
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n", draft)
+        if len(paragraph.strip()) >= 160
+        and not paragraph.lstrip().startswith(("#", "- ", "* ", "+ "))
+    ]
+    prose_score = 1.0 if len(draft) < 1000 else min(len(paragraphs) / 3, 1.0)
+    enumeration_score = 1 - _ratio(
+        len(bullet_lines), len(body_lines), empty=0.0
+    )
+    article_coherence = (prose_score + enumeration_score) / 2
     material_conflicts = [
         conflict
         for conflict in outputs.get("claim_conflicts", [])
@@ -409,6 +432,11 @@ def evaluate_deterministic_quality(
             "revision_budget_compliance",
             float(revision_count <= max_revisions),
             f"revisions={revision_count}, limit={max_revisions}",
+        ),
+        _score(
+            "article_coherence",
+            article_coherence,
+            f"developed_paragraphs={len(paragraphs)}, bullet_density={1 - enumeration_score:.2f}",
         ),
         _score(
             "consistency_analysis_completion",

@@ -544,6 +544,61 @@ class ReportAudit(BaseModel):
         return self
 
 
+class ReportSectionPlan(BaseModel):
+    """Editorial purpose and claim allocation for one report section."""
+
+    dimension_id: str
+    objective: str
+    synthesis_direction: str
+    claim_ids: list[str] = Field(default_factory=list)
+    transition: str = ""
+
+
+class ReportPlan(BaseModel):
+    """Compact global editorial plan grounded in the audited claim ledger."""
+
+    thesis: str
+    narrative_strategy: str
+    sections: list[ReportSectionPlan] = Field(default_factory=list, max_length=8)
+    conclusion_direction: str
+    limitation_strategy: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_compact_plan(cls, value):
+        """Accept predictable aliases without expanding the provider schema."""
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        normalized.setdefault("thesis", normalized.pop("central_thesis", ""))
+        normalized.setdefault(
+            "narrative_strategy", normalized.pop("narrative", "")
+        )
+        normalized.setdefault("sections", normalized.pop("section_plans", []))
+        normalized.setdefault(
+            "conclusion_direction", normalized.pop("conclusion", "")
+        )
+        normalized.setdefault(
+            "limitation_strategy",
+            normalized.pop(
+                "limitations",
+                "Consolidate material limitations without repeating them after every claim.",
+            ),
+        )
+        for section in normalized.get("sections", []):
+            if not isinstance(section, dict):
+                continue
+            section.setdefault("objective", section.pop("purpose", ""))
+            section.setdefault(
+                "synthesis_direction", section.pop("synthesis", "")
+            )
+            section.setdefault("claim_ids", section.pop("claims", []))
+            section.setdefault(
+                "transition", section.pop("transition_from_previous", "")
+            )
+        return normalized
+
+
 class ClaimConflictItem(BaseModel):
     """One normalized relation between two audited claims."""
 

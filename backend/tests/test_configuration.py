@@ -35,10 +35,27 @@ def test_quality_defaults_allow_adaptive_research():
     assert configuration.max_initial_gaps_per_dimension == 4
     assert configuration.max_gap_no_progress_attempts == 2
     assert configuration.min_independent_sources_per_high_gap == 2
-    assert configuration.max_dimension_reflections == 3
+    assert configuration.dimension_reflection_soft_limit == 3
+    assert configuration.max_dimension_reflections == 5
+    assert configuration.max_reflection_no_progress_rounds == 2
     assert configuration.min_accepted_sources_per_dimension == 2
     assert configuration.max_sources_per_domain == 1
     assert configuration.min_authoritative_sources_per_dimension == 1
     assert configuration.min_primary_sources_per_dimension == 1
     assert configuration.report_sectioning_claim_threshold == 18
     assert configuration.report_sectioning_material_chars == 18000
+
+
+def test_reflection_soft_limit_cannot_exceed_hard_limit():
+    with pytest.raises(ValidationError):
+        Configuration(
+            dimension_reflection_soft_limit=4,
+            max_dimension_reflections=3,
+        )
+
+
+def test_legacy_hard_reflection_limit_clamps_default_soft_limit():
+    configuration = Configuration(max_dimension_reflections=2)
+
+    assert configuration.dimension_reflection_soft_limit == 2
+    assert configuration.max_dimension_reflections == 2

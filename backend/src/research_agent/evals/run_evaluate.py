@@ -133,6 +133,7 @@ async def evaluate_example(
             ),
             "revisions": outputs.get("report_revision_count", 0),
             "report_generation_mode": outputs.get("report_generation_mode", "unknown"),
+            "report_plan_sections": len(outputs.get("report_plan", {}).get("sections", [])),
             "completion_statuses": [
                 result.get("completion_status", "unknown")
                 for result in outputs.get("dimension_results", [])
@@ -331,6 +332,8 @@ async def run_local(args: argparse.Namespace) -> tuple[Path, Path]:
             number_of_research_dimensions=args.dimensions,
             number_of_initial_queries=args.queries,
             max_research_loops=args.research_loops,
+            dimension_reflection_soft_limit=args.reflection_soft_limit,
+            max_dimension_reflections=args.reflection_hard_limit,
             max_report_revisions=args.report_revisions,
             tavily_max_results=args.search_results,
         )
@@ -360,6 +363,8 @@ async def run_local(args: argparse.Namespace) -> tuple[Path, Path]:
             "dimensions": args.dimensions,
             "queries": args.queries,
             "research_loops": args.research_loops,
+            "reflection_soft_limit": args.reflection_soft_limit,
+            "reflection_hard_limit": args.reflection_hard_limit,
             "report_revisions": args.report_revisions,
             "search_results": args.search_results,
             "target_retries": args.target_retries,
@@ -385,7 +390,17 @@ async def run_langsmith(args: argparse.Namespace):
         raise ValueError("--langsmith-dataset is required in LangSmith mode")
     from langsmith import Client
 
-    target = ResearchEvaluationTarget()
+    target = ResearchEvaluationTarget(
+        EvaluationRunConfig(
+            number_of_research_dimensions=args.dimensions,
+            number_of_initial_queries=args.queries,
+            max_research_loops=args.research_loops,
+            dimension_reflection_soft_limit=args.reflection_soft_limit,
+            max_dimension_reflections=args.reflection_hard_limit,
+            max_report_revisions=args.report_revisions,
+            tavily_max_results=args.search_results,
+        )
+    )
     evaluators: list[Any] = [evaluate_deterministic_quality]
     if not args.skip_llm_judges:
         evaluators.extend(
@@ -418,6 +433,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dimensions", type=int, default=2)
     parser.add_argument("--queries", type=int, default=2)
     parser.add_argument("--research-loops", type=int, default=1)
+    parser.add_argument("--reflection-soft-limit", type=int, default=2)
+    parser.add_argument("--reflection-hard-limit", type=int, default=3)
     parser.add_argument("--report-revisions", type=int, default=1)
     parser.add_argument("--search-results", type=int, default=4)
     parser.add_argument("--target-retries", type=int, default=1)
@@ -435,6 +452,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--concurrency must be at least 1")
     if args.target_retries < 0:
         raise ValueError("--target-retries cannot be negative")
+    reflection_soft_limit = getattr(args, "reflection_soft_limit", 2)
+    reflection_hard_limit = getattr(args, "reflection_hard_limit", 3)
+    if reflection_soft_limit < 1:
+        raise ValueError("--reflection-soft-limit must be at least 1")
+    if reflection_hard_limit < reflection_soft_limit:
+        raise ValueError(
+            "--reflection-hard-limit cannot be below --reflection-soft-limit"
+        )
 
 
 def main() -> None:

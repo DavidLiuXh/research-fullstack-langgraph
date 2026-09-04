@@ -75,6 +75,7 @@ class DimensionResult(TypedDict):
     research_loop_count: int
     is_sufficient: bool
     completion_status: str
+    termination_reason: NotRequired[str]
     covered_questions: list[str]
     unresolved_gaps: list[dict]
     contradictions: list[dict]
@@ -120,11 +121,15 @@ class OverallState(TypedDict):
     sources_gathered: Annotated[list[ResearchSource], operator.add]
     initial_search_query_count: int
     max_research_loops: int
+    dimension_reflection_soft_limit: NotRequired[int]
+    max_dimension_reflections: NotRequired[int]
     reasoning_model: str
     report_draft: str
+    report_plan: NotRequired[dict]
     report_generation_mode: str
     report_overview: str
     report_sections: list[dict]
+    report_conclusion: NotRequired[str]
     report_audit: dict
     report_revision_count: int
     max_report_revisions: int
@@ -147,6 +152,8 @@ class DimensionState(TypedDict):
     sources_gathered: Annotated[list[ResearchSource], operator.add]
     initial_search_query_count: int
     max_research_loops: int
+    dimension_reflection_soft_limit: NotRequired[int]
+    max_dimension_reflections: NotRequired[int]
     research_loop_count: int
     is_sufficient: bool
     query_history: Annotated[list[str], operator.add]
@@ -169,14 +176,18 @@ class DimensionState(TypedDict):
     pending_reflection_gaps: list[dict]
     gap_route: str
     dimension_reflection_count: int
+    reflection_no_progress_count: NotRequired[int]
+    last_reflection_progress_snapshot: NotRequired[dict]
     resolved_gap_ids: list[str]
     gap_source_coverage_ids: list[str]
     completion_status: str
+    termination_reason: NotRequired[str]
     claims: list[EvidenceClaim]
     gap_claim_ledger: NotRequired[list[EvidenceClaim]]
     dimension_summary: str
     gap_assessment_failure_count: Annotated[int, operator.add]
     final_gap_audit: NotRequired[dict]
+    skipped_reflection_gaps: NotRequired[list[dict]]
 
 
 class DimensionInput(TypedDict):
@@ -185,6 +196,8 @@ class DimensionInput(TypedDict):
     dimension: ResearchDimension
     initial_search_query_count: int
     max_research_loops: int
+    dimension_reflection_soft_limit: NotRequired[int]
+    max_dimension_reflections: NotRequired[int]
 
 
 class QueryGenerationState(TypedDict):

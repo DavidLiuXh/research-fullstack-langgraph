@@ -21,6 +21,8 @@ class EvaluationRunConfig:
     number_of_research_dimensions: int = 2
     number_of_initial_queries: int = 2
     max_research_loops: int = 1
+    dimension_reflection_soft_limit: int = 2
+    max_dimension_reflections: int = 3
     max_report_revisions: int = 1
     tavily_max_results: int = 4
     tavily_max_retries: int = 1
@@ -67,6 +69,10 @@ class ResearchEvaluationTarget:
             "messages": inputs["messages"],
             "initial_search_query_count": self.run_config.number_of_initial_queries,
             "max_research_loops": self.run_config.max_research_loops,
+            "dimension_reflection_soft_limit": (
+                self.run_config.dimension_reflection_soft_limit
+            ),
+            "max_dimension_reflections": self.run_config.max_dimension_reflections,
         }
         node_trajectory: list[str] = []
         custom_events: list[dict[str, Any]] = []
@@ -139,8 +145,10 @@ class ResearchEvaluationTarget:
             "report_generation_mode": final_state.get(
                 "report_generation_mode", "unknown"
             ),
+            "report_plan": final_state.get("report_plan", {}),
             "report_overview": final_state.get("report_overview", ""),
             "report_sections": final_state.get("report_sections", []),
+            "report_conclusion": final_state.get("report_conclusion", ""),
             "report_audit": final_state.get("report_audit", {}),
             "report_revision_count": final_state.get("report_revision_count", 0),
             "max_report_revisions": final_state.get("max_report_revisions", 0),

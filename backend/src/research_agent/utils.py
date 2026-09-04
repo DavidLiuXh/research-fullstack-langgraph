@@ -321,6 +321,13 @@ def format_dimension_results(
         status = result.get("completion_status") or (
             "sufficient" if result["is_sufficient"] else "loop_limit_reached"
         )
+        termination_reason = result.get("termination_reason", "")
+        if status in {"completed_with_limitations", "budget_exhausted"}:
+            status = "completed with limitations"
+            if termination_reason:
+                status += f"; stop reason: {termination_reason.replace('_', ' ')}"
+        elif status == "search_unavailable":
+            status = "incomplete because web search was unavailable"
         claims = result.get("claims", [])[:max_claims_per_dimension]
         claim_text = (
             "\n".join(

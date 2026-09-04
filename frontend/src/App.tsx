@@ -24,6 +24,8 @@ interface ResearchState extends Record<string, unknown> {
   messages: Message[];
   initial_search_query_count: number;
   max_research_loops: number;
+  dimension_reflection_soft_limit: number;
+  max_dimension_reflections: number;
   reasoning_model: string;
 }
 
@@ -97,7 +99,20 @@ interface ResearchCustomEvent {
   strategy?: string;
   merged_gap_ids?: string[];
   completion_status?: string;
+  termination_reason?: string;
+  planning_mode?: string;
+  section_count?: number;
+  thesis?: string;
 }
+
+const formatCompletionStatus = (status?: string, reason?: string) => {
+  if (status === "completed_with_limitations" || status === "budget_exhausted") {
+    const detail = reason ? `: ${reason.replace(/_/g, " ")}` : "";
+    return `completed with limitations${detail}`;
+  }
+  if (status === "search_unavailable") return "web search unavailable";
+  return status || "complete";
+};
 
 const THREAD_STORAGE_KEY = "research-agent-thread-id";
 
@@ -360,13 +375,25 @@ export default function App() {
         case "dimension_completed":
           processedEvent = {
             title: "Dimension Research Complete",
-            data: `${event.dimension?.title || "Dimension"} (${event.loops} gap searches, ${event.completion_status || "complete"})`,
+            data: `${event.dimension?.title || "Dimension"} (${event.loops} gap searches, ${formatCompletionStatus(event.completion_status, event.termination_reason)})`,
           };
           break;
         case "claims_extracted":
           processedEvent = {
             title: `Extracting Evidence Claims: ${event.dimension?.title || "Dimension"}`,
             data: `${event.claim_count || 0} auditable claims retained`,
+          };
+          break;
+        case "report_plan_created":
+          processedEvent = {
+            title: "Planning Report Narrative",
+            data: `${event.section_count || 0} sections organized around: ${event.thesis || "the audited findings"}`,
+          };
+          break;
+        case "report_planning_fallback":
+          processedEvent = {
+            title: "Report Planning Fallback",
+            data: "A deterministic editorial plan preserved every audited claim.",
           };
           break;
         case "drafting_report":
@@ -450,18 +477,26 @@ export default function App() {
       // Convert effort to queries per pass and focused attempts per evidence gap.
       let initial_search_query_count = 0;
       let max_research_loops = 0;
+      let dimension_reflection_soft_limit = 0;
+      let max_dimension_reflections = 0;
       switch (effort) {
         case "low":
           initial_search_query_count = 1;
           max_research_loops = 1;
+          dimension_reflection_soft_limit = 1;
+          max_dimension_reflections = 2;
           break;
         case "medium":
           initial_search_query_count = 3;
           max_research_loops = 2;
+          dimension_reflection_soft_limit = 3;
+          max_dimension_reflections = 4;
           break;
         case "high":
           initial_search_query_count = 5;
           max_research_loops = 3;
+          dimension_reflection_soft_limit = 4;
+          max_dimension_reflections = 6;
           break;
       }
 
@@ -477,6 +512,8 @@ export default function App() {
         messages: newMessages,
         initial_search_query_count: initial_search_query_count,
         max_research_loops: max_research_loops,
+        dimension_reflection_soft_limit,
+        max_dimension_reflections,
         reasoning_model: model,
       });
     },
