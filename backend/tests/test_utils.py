@@ -288,3 +288,25 @@ def test_dimension_results_include_claim_excerpt_but_not_full_source_content():
 
     assert "Compact evidence excerpt." in rendered
     assert "FULL SOURCE CONTENT MUST NOT BE REPEATED" not in rendered
+
+
+def test_dimension_results_render_a_human_readable_stop_reason():
+    results = [
+        {
+            "research_run_id": "run",
+            "dimension": {"id": "0", "title": "Policy", "scope": "Policy"},
+            "research_content": "",
+            "sources": [],
+            "research_loop_count": 4,
+            "is_sufficient": False,
+            "completion_status": "completed_with_limitations",
+            "termination_reason": "no_progress",
+            "claims": [],
+        }
+    ]
+
+    rendered = format_dimension_results(results)
+
+    assert "completed with limitations" in rendered
+    assert "stop reason: no progress" in rendered
+    assert "budget_exhausted" not in rendered

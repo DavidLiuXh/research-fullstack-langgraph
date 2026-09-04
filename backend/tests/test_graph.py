@@ -19,6 +19,7 @@ from research_agent.graph import (
     extract_claims,
     finalize_answer,
     generate_query,
+    generate_report_plan,
     graph,
     initialize_research_topic,
     merge_gap_registry,
@@ -51,6 +52,8 @@ from research_agent.tools_and_schemas import (
     Reflection,
     ReportAudit,
     ReportConsistencyAudit,
+    ReportPlan,
+    ReportSectionPlan,
     ResearchDimension,
     ResearchDimensionList,
     ResearchGap,
@@ -326,6 +329,35 @@ def _accepted_source(source_id, domain, **overrides):
     }
     source.update(overrides)
     return source
+
+
+def _install_reflection_model(monkeypatch, gaps, *, is_sufficient=False):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class FakeReflectionModel:
+        def with_structured_output(self, schema, method):
+            assert schema is Reflection
+            assert method == "json_mode"
+            return self
+
+        def invoke(self, prompt):
+            return Reflection(
+                is_sufficient=is_sufficient,
+                covered_questions=[],
+                missing_questions=gaps,
+                unsupported_claims=[],
+                contradictions=[],
+                source_quality_issues=[],
+                recommended_search_strategy=[],
+                do_not_repeat=[],
+                completion_reason="Material evidence remains." if gaps else "Complete.",
+                confidence=0.5,
+            )
+
+    monkeypatch.setattr(
+        graph_module, "create_deepseek_model", lambda *a, **k: FakeReflectionModel()
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
 
 
 def test_initial_gap_planning_populates_lifecycle_registry(monkeypatch):
@@ -1053,6 +1085,164 @@ def test_incomplete_dimension_reflection_cannot_exit_without_an_actionable_gap(
     )
 
 
+def _material_reflection_gap(priority="high"):
+    return ResearchGap(
+        gap_id="gap-regulatory-penalties",
+        question="Which 2026 regulation imposes mandatory disclosure penalties?",
+        reason="The penalties could materially change the risk conclusion.",
+        priority=priority,
+        required_source_types=["government"],
+        expected_evidence="The regulation text and its effective date in 2026.",
+        suggested_query_focus="2026 official regulation disclosure penalties",
+    )
+
+
+def _reflection_budget_state(**overrides):
+    sources = [_accepted_source("S1", "one.gov"), _accepted_source("S2", "two.gov")]
+    state = _dimension_state(
+        gap_registry={"gap-one": _gap_record(status="closed")},
+        selected_sources=sources,
+        rejected_sources=[],
+        reflection_history=[],
+        query_history=[],
+        evidence_gain_history=[],
+        gap_claim_ledger=[],
+        resolved_gap_ids=["gap-one"],
+        dimension_reflection_count=2,
+        reflection_no_progress_count=0,
+        dimension_reflection_soft_limit=3,
+        max_dimension_reflections=5,
+    )
+    state.update(overrides)
+    return state
+
+
+def test_reflection_adaptively_extends_after_soft_limit_when_progress_continues(
+    monkeypatch,
+):
+    _install_reflection_model(monkeypatch, [_material_reflection_gap()])
+    result = dimension_reflection(
+        _reflection_budget_state(
+            last_reflection_progress_snapshot={
+                "accepted_source_ids": ["S1"],
+                "verified_claim_keys": [],
+                "resolved_gap_ids": [],
+            }
+        ),
+        {},
+    )
+
+    assert result["completion_status"] == "discovering_gaps"
+    assert result["termination_reason"] == ""
+    assert result["dimension_reflection_count"] == 3
+
+
+def test_reflection_stops_after_two_consecutive_no_progress_rounds(monkeypatch):
+    _install_reflection_model(monkeypatch, [_material_reflection_gap()])
+    snapshot = {
+        "accepted_source_ids": ["S1", "S2"],
+        "verified_claim_keys": [],
+        "resolved_gap_ids": ["gap-one"],
+    }
+    result = dimension_reflection(
+        _reflection_budget_state(
+            dimension_reflection_count=3,
+            reflection_no_progress_count=1,
+            last_reflection_progress_snapshot=snapshot,
+        ),
+        {},
+    )
+
+    assert result["completion_status"] == "completed_with_limitations"
+    assert result["termination_reason"] == "no_progress"
+    assert result["reflection_no_progress_count"] == 2
+
+
+def test_reflection_hard_limit_stops_even_when_evidence_progresses(monkeypatch):
+    _install_reflection_model(monkeypatch, [_material_reflection_gap()])
+    result = dimension_reflection(
+        _reflection_budget_state(
+            dimension_reflection_count=4,
+            last_reflection_progress_snapshot={
+                "accepted_source_ids": ["S1"],
+                "verified_claim_keys": [],
+                "resolved_gap_ids": [],
+            },
+        ),
+        {},
+    )
+
+    assert result["completion_status"] == "completed_with_limitations"
+    assert result["termination_reason"] == "reflection_limit_reached"
+
+
+def test_reflection_does_not_reopen_equivalent_closed_gap(monkeypatch):
+    repeated = ResearchGap(
+        gap_id="gap-one",
+        question="What is the authoritative answer?",
+        reason="The answer should remain supported.",
+        priority="high",
+        required_source_types=["government"],
+        expected_evidence="An official statement.",
+        suggested_query_focus="official statement",
+    )
+    _install_reflection_model(monkeypatch, [repeated])
+    result = dimension_reflection(_reflection_budget_state(), {})
+
+    assert result["pending_reflection_gaps"] == []
+    assert result["completion_status"] == "completed_with_limitations"
+    assert result["termination_reason"] == "optional_or_duplicate_gaps_deferred"
+
+
+def test_reflection_defers_low_impact_background_gap(monkeypatch):
+    _install_reflection_model(monkeypatch, [_material_reflection_gap(priority="low")])
+    result = dimension_reflection(_reflection_budget_state(), {})
+
+    assert result["pending_reflection_gaps"] == []
+    assert result["termination_reason"] == "optional_or_duplicate_gaps_deferred"
+
+
+def test_reflection_reopens_stable_gap_when_source_requirement_changes(monkeypatch):
+    changed = ResearchGap(
+        gap_id="gap-one",
+        question="What is the authoritative answer?",
+        reason="Independent research is now required.",
+        priority="high",
+        required_source_types=["academic"],
+        expected_evidence="An official statement.",
+        suggested_query_focus="official statement",
+    )
+    _install_reflection_model(monkeypatch, [changed])
+    reflected = dimension_reflection(_reflection_budget_state(), {})
+    merged = merge_gap_registry(
+        _reflection_budget_state(
+            pending_reflection_gaps=reflected["pending_reflection_gaps"]
+        )
+    )
+
+    assert reflected["completion_status"] == "discovering_gaps"
+    assert merged["gap_registry"]["gap-one"]["status"] == "reopened"
+    assert merged["gap_registry"]["gap-one"]["required_source_types"] == [
+        "academic"
+    ]
+
+
+def test_reflection_does_not_count_lost_evidence_as_progress():
+    graph_module = importlib.import_module("research_agent.graph")
+    previous = {
+        "accepted_source_ids": ["S1", "S2"],
+        "verified_claim_keys": ["claim-one"],
+        "resolved_gap_ids": ["gap-one"],
+    }
+    current = {
+        "accepted_source_ids": ["S1"],
+        "verified_claim_keys": [],
+        "resolved_gap_ids": [],
+    }
+
+    assert graph_module._reflection_made_progress(previous, current) is False
+
+
 def test_dimension_reflection_never_receives_nonaccepted_source_content(monkeypatch):
     graph_module = importlib.import_module("research_agent.graph")
     prompts = []
@@ -1475,6 +1665,8 @@ def test_dimension_review_approval_dispatches_research(monkeypatch):
         ],
         "initial_search_query_count": 1,
         "max_research_loops": 1,
+        "dimension_reflection_soft_limit": 2,
+        "max_dimension_reflections": 4,
     }
 
     result = review_research_dimensions(state)
@@ -1483,6 +1675,8 @@ def test_dimension_review_approval_dispatches_research(monkeypatch):
     assert result["dimension_approved"] is True
     assert len(routed) == 1
     assert routed[0].node == "research_dimension"
+    assert routed[0].arg["dimension_reflection_soft_limit"] == 2
+    assert routed[0].arg["max_dimension_reflections"] == 4
 
 
 def test_compiled_parent_graph_has_dimension_pipeline():
@@ -1496,6 +1690,7 @@ def test_compiled_parent_graph_has_dimension_pipeline():
         "research_dimension",
         "prepare_report_evidence",
         "detect_claim_conflicts",
+        "generate_report_plan",
         "draft_report",
         "audit_report",
         "revise_report",
@@ -2300,17 +2495,30 @@ def test_large_report_is_generated_and_merged_by_dimension(monkeypatch):
 
         def invoke(self, prompt):
             self.prompts.append(prompt)
-            if "executive overview" in prompt:
+            if "Write a compact executive overview" in prompt:
                 return AIMessage(content="Cross-dimension overview.")
-            dimension = "0" if "Dimension 0" in prompt else "1"
+            if "Write the conclusion" in prompt:
+                return AIMessage(content="Integrated conclusion.")
+            dimension = "0" if "Dimension title:\nDimension 0" in prompt else "1"
             return AIMessage(content=f"Section {dimension} " + ("x" * 5000))
 
     model = SectionModel()
     monkeypatch.setattr(graph_module, "create_deepseek_model", lambda *a, **k: model)
     monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
 
+    state = _report_state(dimensions=2, claims_per_dimension=2)
+    state["report_plan"] = {
+        "thesis": "One integrated thesis.",
+        "narrative_strategy": "Start with implications, then evidence.",
+        "sections": [
+            {"dimension_id": "1", "objective": "Implications"},
+            {"dimension_id": "0", "objective": "Evidence"},
+        ],
+        "conclusion_direction": "Integrate the findings.",
+        "limitation_strategy": "Consolidate limitations.",
+    }
     result = draft_report(
-        _report_state(dimensions=2, claims_per_dimension=2),
+        state,
         {"configurable": {"report_sectioning_claim_threshold": 4}},
     )
 
@@ -2319,7 +2527,11 @@ def test_large_report_is_generated_and_merged_by_dimension(monkeypatch):
     assert len(result["report_draft"]) > 10000
     assert "Section 0" in result["report_draft"]
     assert "Section 1" in result["report_draft"]
-    assert len(model.prompts) == 3
+    assert result["report_draft"].index("## Dimension 1") < result[
+        "report_draft"
+    ].index("## Dimension 0")
+    assert "Integrated conclusion." in result["report_draft"]
+    assert len(model.prompts) == 4
 
 
 def test_sectioned_generation_keeps_all_dimension_claims(monkeypatch):
@@ -2380,7 +2592,7 @@ def test_length_limited_draft_switches_to_citation_safe_section_fallback(
 
     assert result["report_generation_mode"] == "sectioned"
     assert result["report_draft"].startswith("# 调研报告")
-    assert "Verified claim 0-0. [S0-0]" in result["report_draft"]
+    assert "Verified claim 0-0 [S0-0]。" in result["report_draft"]
     assert [event["type"] for event in events] == [
         "drafting_report",
         "report_draft_switching_to_sections",
@@ -2390,6 +2602,7 @@ def test_length_limited_draft_switches_to_citation_safe_section_fallback(
         "report_section_fallback",
         "report_section_completed",
         "report_overview_fallback",
+        "report_conclusion_fallback",
         "report_draft_sectioned",
     ]
 
@@ -2399,9 +2612,11 @@ def test_sectioned_report_revision_preserves_long_report(monkeypatch):
 
     class SectionRevisionModel:
         def invoke(self, prompt):
-            if "executive overview" in prompt:
+            if "Revise the executive overview" in prompt:
                 return AIMessage(content="Revised overview.")
-            dimension = "0" if "Dimension 0" in prompt else "1"
+            if "Revise the conclusion" in prompt:
+                return AIMessage(content="Revised conclusion.")
+            dimension = "0" if "Dimension title:\nDimension 0" in prompt else "1"
             return AIMessage(content=f"Revised section {dimension} " + ("x" * 5000))
 
     monkeypatch.setattr(
@@ -2432,6 +2647,7 @@ def test_sectioned_report_revision_preserves_long_report(monkeypatch):
     assert len(result["report_draft"]) > 10000
     assert "Revised section 0" in result["report_draft"]
     assert "Revised section 1" in result["report_draft"]
+    assert "Revised conclusion." in result["report_draft"]
     assert result["report_revision_count"] == 1
 
 
@@ -2485,6 +2701,8 @@ def test_length_limited_section_revisions_keep_existing_parts(monkeypatch):
         "report_section_revision_skipped",
         "report_overview_revision_retry",
         "report_overview_revision_skipped",
+        "report_conclusion_revision_retry",
+        "report_conclusion_revision_skipped",
         "report_sections_revised",
     ]
 
@@ -2763,6 +2981,89 @@ def test_detect_claim_conflicts_builds_validated_material_ledger(monkeypatch):
     ]
 
 
+def test_report_plan_normalizes_sections_and_preserves_every_claim(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class PlanningModel:
+        def with_structured_output(self, schema, method):
+            assert schema is ReportPlan
+            assert method == "json_mode"
+            return self
+
+        def invoke(self, prompt):
+            assert "C-0-1" in prompt
+            assert "C-1-1" in prompt
+            return ReportPlan(
+                thesis="The dimensions form one cumulative answer.",
+                narrative_strategy="Move from evidence to implications.",
+                sections=[
+                    ReportSectionPlan(
+                        dimension_id="1",
+                        objective="Draw the implications.",
+                        synthesis_direction="Connect evidence to consequences.",
+                        claim_ids=["C-0-1", "C-1-2"],
+                        transition="Turn from evidence to implications.",
+                    ),
+                    ReportSectionPlan(
+                        dimension_id="0",
+                        objective="Establish the evidence base.",
+                        synthesis_direction="Connect causes and consequences.",
+                        claim_ids=[],
+                        transition="Open the argument.",
+                    )
+                ],
+                conclusion_direction="Integrate the supported implications.",
+                limitation_strategy="Consolidate limitations once.",
+            )
+
+    monkeypatch.setattr(
+        graph_module, "create_deepseek_model", lambda *a, **k: PlanningModel()
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    state = _report_state(dimensions=2, claims_per_dimension=2)
+    prepared = prepare_report_evidence(state, {})
+
+    result = generate_report_plan({**state, **prepared, "claim_conflicts": []}, {})
+
+    plan = result["report_plan"]
+    assert [section["dimension_id"] for section in plan["sections"]] == ["1", "0"]
+    assert plan["sections"][0]["claim_ids"] == ["C-1-2", "C-1-1"]
+    assert plan["sections"][1]["claim_ids"] == ["C-0-1", "C-0-2"]
+
+
+def test_report_plan_has_deterministic_fallback_on_structured_failure(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class FailingPlanningModel:
+        def with_structured_output(self, schema, method):
+            return self
+
+        def invoke(self, prompt):
+            raise OutputParserException("invalid plan")
+
+    events = []
+    monkeypatch.setattr(
+        graph_module,
+        "create_deepseek_model",
+        lambda *a, **k: FailingPlanningModel(),
+    )
+    monkeypatch.setattr(
+        graph_module,
+        "emit_research_event",
+        lambda event_type, **data: events.append({"type": event_type, **data}),
+    )
+    state = _report_state(dimensions=1, claims_per_dimension=2)
+    prepared = prepare_report_evidence(state, {})
+
+    result = generate_report_plan({**state, **prepared, "claim_conflicts": []}, {})
+
+    assert result["report_plan"]["sections"][0]["claim_ids"] == [
+        "C-0-1",
+        "C-0-2",
+    ]
+    assert any(event["type"] == "report_planning_fallback" for event in events)
+
+
 def test_report_consistency_audit_requires_explicit_conflict_disclosure(
     monkeypatch,
 ):
@@ -2818,6 +3119,56 @@ def test_report_consistency_audit_requires_explicit_conflict_disclosure(
     assert result["report_consistency_audit"]["omitted_conflict_ids"] == ["CF-1"]
 
 
+def test_report_audit_rejects_claim_inventory_instead_of_article(monkeypatch):
+    graph_module = importlib.import_module("research_agent.graph")
+
+    class PassingAuditModels:
+        schema = None
+
+        def with_structured_output(self, schema, method):
+            self.schema = schema
+            return self
+
+        def invoke(self, prompt):
+            if self.schema is ReportConsistencyAudit:
+                return ReportConsistencyAudit(passes=True)
+            return ReportAudit(passes=True)
+
+    monkeypatch.setattr(
+        graph_module, "create_deepseek_model", lambda *a, **k: PassingAuditModels()
+    )
+    monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
+    state = _report_state(dimensions=1)
+    prepared = prepare_report_evidence(state, {})
+    bullet_report = "# Report\n\n" + "\n".join(
+        f"- Summary point {index}." for index in range(1, 8)
+    )
+
+    result = audit_report(
+        {
+            **state,
+            **prepared,
+            "claim_conflicts": [],
+            "consistency_analysis_complete": True,
+            "report_draft": bullet_report,
+            "report_revision_count": 0,
+        },
+        {},
+    )
+
+    assert result["report_audit"]["passes"] is False
+    assert any(
+        "bullet-like claim enumeration" in issue
+        for issue in result["report_audit"]["issues"]
+    )
+    assert not any(
+        "bullet-like claim enumeration" in issue
+        for issue in graph_module._report_article_style_findings(
+            bullet_report, "Please provide a checklist"
+        )
+    )
+
+
 def test_safe_report_discloses_both_sides_of_material_conflict(monkeypatch):
     graph_module = importlib.import_module("research_agent.graph")
     monkeypatch.setattr(graph_module, "emit_research_event", lambda *a, **k: None)
@@ -2846,6 +3197,9 @@ def test_safe_report_discloses_both_sides_of_material_conflict(monkeypatch):
     assert "CF-1" in result["report_draft"]
     assert "[S0-0]" in result["report_draft"]
     assert "[S1-0]" in result["report_draft"]
+    assert not any(
+        line.startswith("- ") for line in result["report_draft"].splitlines()
+    )
 
 
 def test_claim_extraction_skips_model_when_no_screened_evidence(monkeypatch):

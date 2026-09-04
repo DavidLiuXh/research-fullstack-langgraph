@@ -14,7 +14,8 @@ The first-phase suite combines deterministic checks with DeepSeek-as-judge:
 - domain diversity and workflow trajectory completeness
 - clarification routing and report revision budget compliance
 - single-pass versus sectioned report generation mode
-- relevance, structure, completeness, source quality, analytical rigor, balance
+- deterministic article coherence, including paragraph development and bullet density
+- relevance, thesis-led structure, completeness, source quality, analytical rigor, balance
 
 Run a bounded local smoke evaluation from `backend/`:
 
@@ -28,7 +29,8 @@ Results are written as JSON and Markdown under
 model defaults to `deepseek-v4-pro` and can be changed with `EVALUATION_MODEL`.
 Failed graph examples are retried once by default; use `--target-retries` to
 change that bounded retry policy. Reports retain the attempt count and final
-failure stage.
+failure stage. Use `--reflection-soft-limit` and `--reflection-hard-limit` to
+evaluate adaptive dimension-reflection budgets explicitly.
 
 To evaluate an existing LangSmith dataset:
 

@@ -63,11 +63,31 @@ class Configuration(BaseModel):
         description="Independent accepted sources required to close a high-priority gap.",
     )
 
-    max_dimension_reflections: int = Field(
+    dimension_reflection_soft_limit: int = Field(
         default=3,
         ge=1,
         le=6,
-        description="Maximum whole-dimension audits that may discover or reopen gaps.",
+        description=(
+            "Reflection rounds normally allowed before only material, progressing "
+            "gaps may extend the research."
+        ),
+    )
+
+    max_dimension_reflections: int = Field(
+        default=5,
+        ge=1,
+        le=8,
+        description="Hard cap on whole-dimension audits, including adaptive extensions.",
+    )
+
+    max_reflection_no_progress_rounds: int = Field(
+        default=2,
+        ge=1,
+        le=3,
+        description=(
+            "Consecutive dimension reflections without new accepted evidence, "
+            "verified claims, or resolved gaps before stopping early."
+        ),
     )
 
     max_report_revisions: int = Field(
@@ -127,6 +147,14 @@ class Configuration(BaseModel):
                 raise ValueError(
                     f"{field_name} must not exceed max_selected_sources_per_dimension"
                 )
+        if self.dimension_reflection_soft_limit > self.max_dimension_reflections:
+            if "dimension_reflection_soft_limit" not in self.model_fields_set:
+                self.dimension_reflection_soft_limit = self.max_dimension_reflections
+                return self
+            raise ValueError(
+                "dimension_reflection_soft_limit must not exceed "
+                "max_dimension_reflections"
+            )
         return self
 
     max_source_candidates_per_dimension: int = Field(

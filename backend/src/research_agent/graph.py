@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, cast
@@ -42,9 +43,12 @@ from research_agent.prompts import (
     query_writer_instructions,
     reflection_instructions,
     report_audit_instructions,
+    report_conclusion_instructions,
+    report_conclusion_revision_instructions,
     report_consistency_audit_instructions,
     report_overview_instructions,
     report_overview_revision_instructions,
+    report_planning_instructions,
     report_revision_instructions,
     report_section_instructions,
     report_section_revision_instructions,
@@ -67,6 +71,8 @@ from research_agent.tools_and_schemas import (
     Reflection,
     ReportAudit,
     ReportConsistencyAudit,
+    ReportPlan,
+    ReportSectionPlan,
     ResearchDimensionList,
     ResearchGap,
     ResearchGapPlan,
@@ -219,6 +225,109 @@ def _scope_terms(value: str) -> set[str]:
         for token in re.findall(r"[a-z][a-z0-9-]{3,}", value.casefold())
         if token not in _SCOPE_STOPWORDS and not token.isdigit()
     }
+
+
+def _gap_similarity_tokens(value: str) -> set[str]:
+    """Tokenize English and Chinese gap requirements for conservative deduping."""
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    english = {
+        token
+        for token in re.findall(r"[a-z][a-z0-9-]{2,}", normalized)
+        if token not in _SCOPE_STOPWORDS
+    }
+    chinese_chunks = re.findall(r"[\u3400-\u9fff]+", normalized)
+    chinese = {
+        chunk[index : index + 2]
+        for chunk in chinese_chunks
+        for index in range(max(len(chunk) - 1, 0))
+    }
+    return english | chinese
+
+
+def _gap_requirement_text(gap: Mapping[str, Any]) -> str:
+    return " ".join(
+        str(gap.get(field, ""))
+        for field in ("question", "expected_evidence", "suggested_query_focus")
+    ).strip()
+
+
+def _gaps_are_semantically_equivalent(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> bool:
+    """Reject only high-confidence paraphrases of an already tracked gap."""
+    if left.get("gap_id") and left.get("gap_id") == right.get("gap_id"):
+        return True
+    left_tokens = _gap_similarity_tokens(_gap_requirement_text(left))
+    right_tokens = _gap_similarity_tokens(_gap_requirement_text(right))
+    if not left_tokens or not right_tokens:
+        return False
+    overlap = len(left_tokens & right_tokens)
+    containment = overlap / min(len(left_tokens), len(right_tokens))
+    union = len(left_tokens | right_tokens)
+    jaccard = overlap / union if union else 0
+    return containment >= 0.85 and jaccard >= 0.65
+
+
+def _same_gap_requirement(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    """Return whether a repeated stable ID has materially unchanged requirements."""
+    left_types = sorted(str(item) for item in left.get("required_source_types", []))
+    right_types = sorted(str(item) for item in right.get("required_source_types", []))
+    left_without_id = {**left, "gap_id": ""}
+    right_without_id = {**right, "gap_id": ""}
+    return (
+        _gaps_are_semantically_equivalent(left_without_id, right_without_id)
+        and left_types == right_types
+        and str(left.get("priority", "medium")) == str(right.get("priority", "medium"))
+    )
+
+
+def _is_material_actionable_gap(gap: Mapping[str, Any]) -> bool:
+    """Keep only consequential gaps that specify a searchable evidence target."""
+    if str(gap.get("priority", "low")) not in {"high", "medium"}:
+        return False
+    question = str(gap.get("question", "")).strip()
+    expected = str(gap.get("expected_evidence", "")).strip()
+    focus = str(gap.get("suggested_query_focus", "")).strip()
+    return bool(question and focus and (expected or len(question) >= 20))
+
+
+def _reflection_progress_snapshot(
+    state: DimensionState, accepted_sources: list[ResearchSource]
+) -> dict[str, list[str]]:
+    """Capture durable progress signals between whole-dimension audits."""
+    claim_keys = []
+    for claim in state.get("gap_claim_ledger", []):
+        claim_keys.append(
+            "|".join(
+                [
+                    str(claim.get("claim", "")).strip(),
+                    *sorted(str(item) for item in claim.get("supporting_source_ids", [])),
+                ]
+            )
+        )
+    return {
+        "accepted_source_ids": sorted(
+            str(source.get("source_id", ""))
+            for source in accepted_sources
+            if source.get("source_id")
+        ),
+        "verified_claim_keys": sorted(set(claim_keys)),
+        "resolved_gap_ids": sorted(str(item) for item in state.get("resolved_gap_ids", [])),
+    }
+
+
+def _reflection_made_progress(
+    previous: Mapping[str, Any], current: Mapping[str, Any]
+) -> bool:
+    """Count only newly added durable evidence or closures as progress."""
+    return any(
+        set(current.get(field, [])) - set(previous.get(field, []))
+        for field in (
+            "accepted_source_ids",
+            "verified_claim_keys",
+            "resolved_gap_ids",
+        )
+    )
 
 
 def _claim_scope_rejection_reasons(
@@ -547,21 +656,23 @@ def route_dimension_review(state: OverallState):
 def dispatch_research_dimensions(state: OverallState):
     """Run one isolated research subgraph for each dimension in parallel."""
     topic = state["normalized_research_topic"]
-    return [
-        Send(
-            "research_dimension",
-            {
-                "research_topic": topic,
-                "research_run_id": state["research_run_id"],
-                "dimension": dimension,
-                "initial_search_query_count": state.get(
-                    "initial_search_query_count", 3
-                ),
-                "max_research_loops": state.get("max_research_loops", 3),
-            },
-        )
-        for dimension in state["research_dimensions"]
-    ]
+    sends = []
+    for dimension in state["research_dimensions"]:
+        dimension_input = {
+            "research_topic": topic,
+            "research_run_id": state["research_run_id"],
+            "dimension": dimension,
+            "initial_search_query_count": state.get("initial_search_query_count", 3),
+            "max_research_loops": state.get("max_research_loops", 3),
+        }
+        for field in (
+            "dimension_reflection_soft_limit",
+            "max_dimension_reflections",
+        ):
+            if state.get(field) is not None:
+                dimension_input[field] = state[field]
+        sends.append(Send("research_dimension", dimension_input))
+    return sends
 
 
 def _operational_gap(gap: Mapping[str, Any], *, origin: str) -> dict[str, Any]:
@@ -649,8 +760,11 @@ def plan_initial_gaps(state: DimensionState, config: RunnableConfig):
         "gap_processing_complete": False,
         "pending_reflection_gaps": [],
         "dimension_reflection_count": 0,
+        "reflection_no_progress_count": 0,
+        "last_reflection_progress_snapshot": {},
         "research_loop_count": 0,
         "completion_status": "researching",
+        "termination_reason": "",
         "is_sufficient": False,
         "resolved_gap_ids": [],
         "gap_source_coverage_ids": [],
@@ -2087,6 +2201,60 @@ def _quality_requirement_gaps(
     return gaps
 
 
+def _filter_reflection_candidates(
+    candidates: list[dict], registry: Mapping[str, Mapping[str, Any]]
+) -> tuple[list[dict], list[dict]]:
+    """Keep material novel gaps and explain why repeated/optional ones were skipped."""
+    pending: list[dict] = []
+    skipped: list[dict] = []
+    comparison_pool: list[Mapping[str, Any]] = list(registry.values())
+    for candidate in candidates:
+        if not _is_material_actionable_gap(candidate):
+            skipped.append(
+                {
+                    "gap_id": candidate.get("gap_id", ""),
+                    "reason": "optional_or_not_actionable",
+                }
+            )
+            continue
+        exact_existing = registry.get(str(candidate.get("gap_id", "")))
+        if (
+            str(candidate.get("gap_id", "")).startswith("quality-")
+            and exact_existing
+            and exact_existing.get("status") == "closed"
+            and not any(
+                item.get("gap_id") == candidate.get("gap_id") for item in pending
+            )
+        ):
+            pending.append(candidate)
+            comparison_pool.append(candidate)
+            continue
+        equivalent = next(
+            (
+                existing
+                for existing in comparison_pool
+                if _gaps_are_semantically_equivalent(candidate, existing)
+            ),
+            None,
+        )
+        if equivalent is not None and not _same_gap_requirement(
+            candidate, equivalent
+        ):
+            equivalent = None
+        if equivalent is not None:
+            skipped.append(
+                {
+                    "gap_id": candidate.get("gap_id", ""),
+                    "equivalent_gap_id": equivalent.get("gap_id", ""),
+                    "reason": "duplicate_or_already_tracked",
+                }
+            )
+            continue
+        pending.append(candidate)
+        comparison_pool.append(candidate)
+    return pending, skipped
+
+
 def dimension_reflection(state: DimensionState, config: RunnableConfig):
     """Audit complete dimension coverage and discover only actionable new gaps."""
     configurable = Configuration.from_runnable_config(config)
@@ -2217,26 +2385,12 @@ def dimension_reflection(state: DimensionState, config: RunnableConfig):
                 origin="discovered",
             )
         )
-    pending: list[dict] = []
-    for candidate in candidates:
+    pending, skipped_candidates = _filter_reflection_candidates(candidates, registry)
+    for candidate in pending:
         existing = registry.get(candidate["gap_id"])
-        if existing and existing.get("status") == "unresolvable":
-            prior_requirement = (
-                existing.get("question"),
-                existing.get("expected_evidence"),
-                tuple(existing.get("required_source_types", [])),
-            )
-            new_requirement = (
-                candidate.get("question"),
-                candidate.get("expected_evidence"),
-                tuple(candidate.get("required_source_types", [])),
-            )
-            if prior_requirement == new_requirement:
-                continue
-        if existing and existing.get("status") == "closed":
+        if existing and existing.get("status") in {"closed", "unresolvable"}:
             candidate["origin"] = "reopened"
             candidate["status"] = "reopened"
-        pending.append(candidate)
 
     quality_gaps = _quality_requirement_gaps(state, configurable)
     unresolved_conflict = any(
@@ -2254,16 +2408,75 @@ def dimension_reflection(state: DimensionState, config: RunnableConfig):
         and state.get("search_failures")
         and state.get("search_success_count", 0) == 0
     )
+    progress_snapshot = _reflection_progress_snapshot(state, accepted)
+    previous_snapshot = state.get("last_reflection_progress_snapshot") or None
+    if previous_snapshot is None or _reflection_made_progress(
+        previous_snapshot, progress_snapshot
+    ):
+        reflection_no_progress_count = 0
+    else:
+        reflection_no_progress_count = (
+            int(state.get("reflection_no_progress_count", 0)) + 1
+        )
+    soft_limit = min(
+        6,
+        max(
+            1,
+            int(
+                state.get(
+                    "dimension_reflection_soft_limit",
+                    configurable.dimension_reflection_soft_limit,
+                )
+            ),
+        ),
+    )
+    hard_limit = min(
+        8,
+        max(
+            soft_limit,
+            int(
+                state.get(
+                    "max_dimension_reflections",
+                    configurable.max_dimension_reflections,
+                )
+            )
+        ),
+    )
+    within_soft_budget = reflection_count < soft_limit
+    adaptive_extension = bool(
+        pending
+        and reflection_count < hard_limit
+        and reflection_no_progress_count
+        < configurable.max_reflection_no_progress_rounds
+    )
+    should_continue = bool(pending and (within_soft_budget or adaptive_extension))
+
+    termination_reason = ""
     if search_unavailable:
         completion_status = "search_unavailable"
+        termination_reason = "search_unavailable"
     elif deterministic_sufficient:
         completion_status = "sufficient"
-    elif pending and reflection_count < configurable.max_dimension_reflections:
+    elif should_continue:
         completion_status = "discovering_gaps"
-    elif reflection_count >= configurable.max_dimension_reflections:
-        completion_status = "budget_exhausted"
     else:
-        completion_status = "partial"
+        completion_status = "completed_with_limitations"
+        if pending and reflection_no_progress_count >= (
+            configurable.max_reflection_no_progress_rounds
+        ):
+            termination_reason = "no_progress"
+        elif pending and reflection_count >= hard_limit:
+            termination_reason = "reflection_limit_reached"
+        elif unresolved_conflict:
+            termination_reason = "unresolved_contradiction"
+        elif quality_gaps:
+            termination_reason = "source_quality_unmet"
+        elif unresolved_terminal:
+            termination_reason = "gap_attempts_exhausted"
+        elif skipped_candidates:
+            termination_reason = "optional_or_duplicate_gaps_deferred"
+        else:
+            termination_reason = "unresolved_evidence"
 
     unresolved = [gap for gap in registry.values() if gap.get("status") != "closed"]
     missing_by_id = {gap["gap_id"]: gap for gap in unresolved}
@@ -2294,6 +2507,10 @@ def dimension_reflection(state: DimensionState, config: RunnableConfig):
         confidence=result.confidence,
         reflection=reflection_count,
         completion_status=completion_status,
+        termination_reason=termination_reason,
+        reflection_soft_limit=soft_limit,
+        reflection_hard_limit=hard_limit,
+        reflection_no_progress_count=reflection_no_progress_count,
         knowledge_gap=knowledge_gap,
     )
     return {
@@ -2303,7 +2520,11 @@ def dimension_reflection(state: DimensionState, config: RunnableConfig):
         "reflection_history": [assessment],
         "pending_reflection_gaps": pending,
         "dimension_reflection_count": reflection_count,
+        "reflection_no_progress_count": reflection_no_progress_count,
+        "last_reflection_progress_snapshot": progress_snapshot,
         "current_knowledge_gap": knowledge_gap,
+        "termination_reason": termination_reason,
+        "skipped_reflection_gaps": skipped_candidates,
     }
 
 
@@ -2332,50 +2553,28 @@ def merge_gap_registry(state: DimensionState):
             resolved_ids.discard(gap_id)
             merged_ids.append(gap_id)
             continue
-        if existing.get("status") == "closed":
-            candidate.update(
-                {
-                    "origin": "reopened",
-                    "status": "reopened",
-                    "attempt_count": 0,
-                    "no_progress_count": 0,
-                    "strategy_level": int(existing.get("strategy_level", 0)) + 1,
-                    "matched_source_ids": existing.get("matched_source_ids", []),
-                    "retained_evidence_source_ids": existing.get(
-                        "retained_evidence_source_ids",
-                        existing.get("matched_source_ids", []),
-                    ),
-                    "supported_claims": existing.get("supported_claims", []),
-                }
-            )
-            registry[gap_id] = candidate
-            resolved_ids.discard(gap_id)
-            merged_ids.append(gap_id)
+        if not gap_id.startswith("quality-") and _same_gap_requirement(
+            candidate, existing
+        ):
             continue
-        if existing.get("status") == "unresolvable":
-            prior_requirement = (
-                existing.get("question"),
-                existing.get("expected_evidence"),
-                tuple(existing.get("required_source_types", [])),
-            )
-            new_requirement = (
-                candidate.get("question"),
-                candidate.get("expected_evidence"),
-                tuple(candidate.get("required_source_types", [])),
-            )
-            if prior_requirement == new_requirement:
-                continue
-            candidate.update(
-                {
-                    "origin": "reopened",
-                    "status": "reopened",
-                    "attempt_count": 0,
-                    "no_progress_count": 0,
-                }
-            )
-            registry[gap_id] = candidate
-            resolved_ids.discard(gap_id)
-            merged_ids.append(gap_id)
+        candidate.update(
+            {
+                "origin": "reopened",
+                "status": "reopened",
+                "attempt_count": 0,
+                "no_progress_count": 0,
+                "strategy_level": int(existing.get("strategy_level", 0)) + 1,
+                "matched_source_ids": existing.get("matched_source_ids", []),
+                "retained_evidence_source_ids": existing.get(
+                    "retained_evidence_source_ids",
+                    existing.get("matched_source_ids", []),
+                ),
+                "supported_claims": existing.get("supported_claims", []),
+            }
+        )
+        registry[gap_id] = candidate
+        resolved_ids.discard(gap_id)
+        merged_ids.append(gap_id)
 
     emit_research_event(
         "gap_registry_merged",
@@ -2390,6 +2589,7 @@ def merge_gap_registry(state: DimensionState):
         "pending_reflection_gaps": [],
         "gap_processing_complete": False,
         "completion_status": "researching",
+        "termination_reason": "",
     }
 
 
@@ -2936,18 +3136,24 @@ def audit_final_gap_ledger(state: DimensionState, config: RunnableConfig):
     )
     is_sufficient = bool(registry and not unresolved and not unresolved_conflict)
     prior_completion = state.get("completion_status", "partial")
+    termination_reason = state.get("termination_reason", "")
     if retryable_gap_ids:
         completion_status = "researching"
+        termination_reason = ""
         is_sufficient = False
     elif prior_completion == "search_unavailable":
         completion_status = "search_unavailable"
+        termination_reason = "search_unavailable"
         is_sufficient = False
     elif is_sufficient:
         completion_status = "sufficient"
-    elif prior_completion == "budget_exhausted":
-        completion_status = "budget_exhausted"
+        termination_reason = ""
+    elif prior_completion in {"completed_with_limitations", "budget_exhausted"}:
+        completion_status = "completed_with_limitations"
+        termination_reason = termination_reason or "reflection_limit_reached"
     else:
-        completion_status = "partial"
+        completion_status = "completed_with_limitations"
+        termination_reason = termination_reason or "final_gap_audit_unresolved"
     reflection_assessment = dict(state.get("reflection_assessment", {}))
     reflection_assessment["is_sufficient"] = is_sufficient
     reflection_assessment["missing_questions"] = unresolved
@@ -2977,6 +3183,7 @@ def audit_final_gap_ledger(state: DimensionState, config: RunnableConfig):
         "gap_source_coverage_ids": sorted(coverage_ids),
         "is_sufficient": is_sufficient,
         "completion_status": completion_status,
+        "termination_reason": termination_reason,
         "reflection_assessment": reflection_assessment,
         "current_knowledge_gap": knowledge_gap,
         "final_gap_audit": final_audit,
@@ -3196,6 +3403,7 @@ def research_dimension(state: DimensionInput, config: RunnableConfig):
         "research_loop_count": result["research_loop_count"],
         "is_sufficient": result["is_sufficient"],
         "completion_status": result["completion_status"],
+        "termination_reason": result.get("termination_reason", ""),
         "covered_questions": result["reflection_assessment"].get(
             "covered_questions", []
         ),
@@ -3262,6 +3470,7 @@ def research_dimension(state: DimensionInput, config: RunnableConfig):
         is_sufficient=result["is_sufficient"],
         loops=result["research_loop_count"],
         completion_status=result["completion_status"],
+        termination_reason=result.get("termination_reason", ""),
     )
     return {
         "dimension_results": [dimension_result],
@@ -3580,6 +3789,217 @@ def detect_claim_conflicts(state: OverallState, config: RunnableConfig):
     }
 
 
+def _fallback_report_plan(
+    results: list[DimensionResult], research_topic: str
+) -> dict[str, Any]:
+    """Build a complete evidence-safe editorial plan without factual invention."""
+    sections = []
+    for index, result in enumerate(results):
+        dimension = result["dimension"]
+        sections.append(
+            ReportSectionPlan(
+                dimension_id=str(dimension["id"]),
+                objective=f"Explain how {dimension['title']} answers its assigned scope.",
+                synthesis_direction=(
+                    "Connect the audited findings through chronology, causality, "
+                    "comparison, or implications instead of enumerating them."
+                ),
+                claim_ids=[
+                    str(claim["claim_id"])
+                    for claim in result.get("claims", [])
+                    if claim.get("claim_id")
+                ],
+                transition=(
+                    "Establish the foundation for the argument."
+                    if index == 0
+                    else "Build on the preceding section without repeating it."
+                ),
+            ).model_dump()
+        )
+    return ReportPlan(
+        thesis=(
+            f"Answer {research_topic} by integrating the audited findings across "
+            "the research dimensions and keeping material uncertainty explicit."
+        ),
+        narrative_strategy=(
+            "Develop one cumulative argument across the dimensions, moving from "
+            "context and evidence to interpretation and implications."
+        ),
+        sections=[ReportSectionPlan.model_validate(item) for item in sections],
+        conclusion_direction=(
+            "Answer the main question directly by integrating the strongest findings "
+            "and the limitations that materially affect interpretation."
+        ),
+        limitation_strategy=(
+            "Consolidate limitations at the point where they affect interpretation "
+            "and avoid repeating generic caveats after individual facts."
+        ),
+    ).model_dump()
+
+
+def _normalize_report_plan(
+    plan: ReportPlan,
+    results: list[DimensionResult],
+    research_topic: str,
+) -> dict[str, Any]:
+    """Constrain model planning to known dimensions and audited claim IDs."""
+    fallback = _fallback_report_plan(results, research_topic)
+    result_by_dimension = {
+        str(result["dimension"]["id"]): result for result in results
+    }
+    proposed_by_dimension = {}
+    proposed_order = []
+    for section in plan.sections:
+        dimension_id = str(section.dimension_id)
+        if (
+            dimension_id not in result_by_dimension
+            or dimension_id in proposed_by_dimension
+        ):
+            continue
+        proposed_by_dimension[dimension_id] = section
+        proposed_order.append(dimension_id)
+    ordered_dimension_ids = [
+        *proposed_order,
+        *[
+            dimension_id
+            for dimension_id in result_by_dimension
+            if dimension_id not in proposed_by_dimension
+        ],
+    ]
+    fallback_by_dimension = {
+        str(section["dimension_id"]): section for section in fallback["sections"]
+    }
+    normalized_sections = []
+    for dimension_id in ordered_dimension_ids:
+        result = result_by_dimension[dimension_id]
+        fallback_section = fallback_by_dimension[dimension_id]
+        valid_claim_ids = [
+            str(claim["claim_id"])
+            for claim in result.get("claims", [])
+            if claim.get("claim_id")
+        ]
+        proposed = proposed_by_dimension.get(dimension_id)
+        proposed_ids = (
+            [claim_id for claim_id in proposed.claim_ids if claim_id in valid_claim_ids]
+            if proposed
+            else []
+        )
+        claim_ids = list(dict.fromkeys([*proposed_ids, *valid_claim_ids]))
+        normalized_sections.append(
+            {
+                "dimension_id": dimension_id,
+                "objective": (
+                    proposed.objective.strip()
+                    if proposed and proposed.objective.strip()
+                    else fallback_section["objective"]
+                ),
+                "synthesis_direction": (
+                    proposed.synthesis_direction.strip()
+                    if proposed and proposed.synthesis_direction.strip()
+                    else fallback_section["synthesis_direction"]
+                ),
+                "claim_ids": claim_ids,
+                "transition": (
+                    proposed.transition.strip()
+                    if proposed and proposed.transition.strip()
+                    else fallback_section["transition"]
+                ),
+            }
+        )
+    return {
+        "thesis": plan.thesis.strip() or fallback["thesis"],
+        "narrative_strategy": (
+            plan.narrative_strategy.strip() or fallback["narrative_strategy"]
+        ),
+        "sections": normalized_sections,
+        "conclusion_direction": (
+            plan.conclusion_direction.strip() or fallback["conclusion_direction"]
+        ),
+        "limitation_strategy": (
+            plan.limitation_strategy.strip() or fallback["limitation_strategy"]
+        ),
+    }
+
+
+def generate_report_plan(state: OverallState, config: RunnableConfig):
+    """Plan a single narrative before drafting independent report sections."""
+    configurable = Configuration.from_runnable_config(config)
+    results = state.get("report_dimension_results", [])
+    topic = state["normalized_research_topic"]
+    claim_catalog = [
+        {
+            "dimension_id": str(result["dimension"]["id"]),
+            "dimension_title": result["dimension"]["title"],
+            "dimension_scope": result["dimension"]["scope"],
+            "claims": [
+                {
+                    "claim_id": claim.get("claim_id", ""),
+                    "claim": claim.get("claim", ""),
+                    "uncertainty": claim.get("uncertainty_reason", ""),
+                }
+                for claim in result.get("claims", [])
+            ],
+        }
+        for result in results
+    ]
+    prompt = report_planning_instructions.format(
+        output_schema=json.dumps(ReportPlan.model_json_schema(), ensure_ascii=False),
+        research_topic=topic,
+        claim_catalog=json.dumps(claim_catalog, ensure_ascii=False),
+        conflict_ledger=_format_conflict_ledger(state.get("claim_conflicts", [])),
+    )
+    model = state.get("reasoning_model") or configurable.answer_model
+    fallback = _fallback_report_plan(results, topic)
+    try:
+        proposed = (
+            create_deepseek_model(model)
+            .with_structured_output(ReportPlan, method="json_mode")
+            .invoke(prompt)
+        )
+        if not isinstance(proposed, ReportPlan):
+            raise TypeError("Report planning returned an unexpected type")
+        plan = _normalize_report_plan(proposed, results, topic)
+        planning_mode = "model"
+    except (
+        AttributeError,
+        LengthFinishReasonError,
+        OutputParserException,
+        TypeError,
+        ValueError,
+    ) as error:
+        plan = fallback
+        planning_mode = "deterministic_fallback"
+        emit_research_event(
+            "report_planning_fallback",
+            research_run_id=state["research_run_id"],
+            error=str(error),
+        )
+    emit_research_event(
+        "report_plan_created",
+        research_run_id=state["research_run_id"],
+        planning_mode=planning_mode,
+        section_count=len(plan["sections"]),
+        thesis=plan["thesis"],
+    )
+    return {"report_plan": plan}
+
+
+def _order_results_by_report_plan(
+    results: list[DimensionResult], report_plan: Mapping[str, Any]
+) -> list[DimensionResult]:
+    """Apply the validated editorial section order without dropping dimensions."""
+    result_by_dimension = {
+        str(result["dimension"]["id"]): result for result in results
+    }
+    ordered = []
+    for section in report_plan.get("sections", []):
+        result = result_by_dimension.pop(str(section.get("dimension_id", "")), None)
+        if result is not None:
+            ordered.append(result)
+    ordered.extend(result_by_dimension.values())
+    return ordered
+
+
 def _audited_claim_source_ids(results: list[DimensionResult]) -> set[str]:
     """Collect source IDs explicitly attached to audited claims."""
     return {
@@ -3609,22 +4029,65 @@ def _uses_chinese(text: str) -> bool:
     return bool(re.search(r"[\u3400-\u9fff]", text))
 
 
+def _research_limitation_message(result: DimensionResult, *, chinese: bool) -> str:
+    """Translate internal stop reasons into concise report-facing language."""
+    reason = result.get("termination_reason", "unresolved_evidence")
+    chinese_reasons = {
+        "gap_attempts_exhausted": "部分证据缺口已达到搜索次数上限",
+        "reflection_limit_reached": "已达到维度复核的硬上限",
+        "no_progress": "连续复核未获得新的有效证据",
+        "source_quality_unmet": "来源质量或来源类型要求仍未完全满足",
+        "unresolved_contradiction": "仍存在需要进一步核实的矛盾证据",
+        "search_unavailable": "网页搜索服务不可用",
+        "optional_or_duplicate_gaps_deferred": "其余缺口属于重复或低影响问题",
+        "final_gap_audit_unresolved": "最终证据审计仍发现未关闭的缺口",
+        "unresolved_evidence": "仍有证据缺口未完全解决",
+    }
+    english_reasons = {
+        "gap_attempts_exhausted": "some evidence gaps reached their search-attempt limit",
+        "reflection_limit_reached": "the hard dimension-reflection limit was reached",
+        "no_progress": "consecutive audits found no new qualifying evidence",
+        "source_quality_unmet": "source quality or source-type requirements remain unmet",
+        "unresolved_contradiction": "material contradictory evidence remains unresolved",
+        "search_unavailable": "web search was unavailable",
+        "optional_or_duplicate_gaps_deferred": "remaining gaps were duplicate or low impact",
+        "final_gap_audit_unresolved": "the final evidence audit found unresolved gaps",
+        "unresolved_evidence": "some evidence gaps remain unresolved",
+    }
+    if chinese:
+        return "已完成并保留局限性说明：" + chinese_reasons.get(
+            reason, chinese_reasons["unresolved_evidence"]
+        ) + "。"
+    return "Completed with limitations: " + english_reasons.get(
+        reason, english_reasons["unresolved_evidence"]
+    ) + "."
+
+
 def _deterministic_report_section(result: DimensionResult, research_topic: str) -> str:
     """Build a bounded, citation-safe section when model generation cannot finish."""
     chinese = _uses_chinese(research_topic)
     claims = result.get("claims", [])
     if claims:
-        findings = "\n".join(
-            "- "
-            + claim["claim"]
-            + " "
-            + " ".join(f"[{source_id}]" for source_id in claim["supporting_source_ids"])
-            + (
-                f" Uncertainty: {claim['uncertainty_reason']}"
-                if claim.get("uncertainty_reason")
-                else ""
+        sentences = []
+        for claim in claims:
+            sentence = claim["claim"].strip().rstrip(".!?。！？")
+            markers = " ".join(
+                f"[{source_id}]" for source_id in claim["supporting_source_ids"]
             )
-            for claim in claims
+            sentence = f"{sentence} {markers}".strip()
+            if claim.get("uncertainty_reason"):
+                sentence += (
+                    f" 这一判断仍需注意：{claim['uncertainty_reason']}"
+                    if chinese
+                    else f" This finding remains qualified by {claim['uncertainty_reason']}"
+                )
+            if sentence[-1:] not in ".!?。！？":
+                sentence += "。" if chinese else "."
+            sentences.append(sentence)
+        separator = "" if chinese else " "
+        findings = "\n\n".join(
+            separator.join(sentences[index : index + 3])
+            for index in range(0, len(sentences), 3)
         )
     else:
         findings = (
@@ -3634,20 +4097,19 @@ def _deterministic_report_section(result: DimensionResult, research_topic: str) 
         )
     limitations = []
     if result.get("completion_status") != "sufficient":
-        limitations.append(
-            ("调研状态：" if chinese else "Research status: ")
-            + f"{result.get('completion_status', 'incomplete')}."
-        )
+        limitations.append(_research_limitation_message(result, chinese=chinese))
     limitations.extend(
         str(gap.get("question") or gap.get("reason") or gap)
         for gap in result.get("unresolved_gaps", [])[:3]
     )
-    limitation_text = (
-        ("\n\n局限性：\n" if chinese else "\n\nLimitations:\n")
-        + "\n".join(f"- {item}" for item in limitations)
-        if limitations
-        else ""
-    )
+    if limitations:
+        separator = "；" if chinese else "; "
+        limitation_text = (
+            "\n\n局限性方面，" if chinese else "\n\nRegarding limitations, "
+        ) + separator.join(item.rstrip("。.") for item in limitations)
+        limitation_text += "。" if chinese else "."
+    else:
+        limitation_text = ""
     return findings + limitation_text
 
 
@@ -3656,15 +4118,58 @@ def _deterministic_report_overview(
 ) -> str:
     """Describe section coverage without adding unsupported factual content."""
     completed = sum(result.get("is_sufficient", False) for result in results)
+    representative_claims = [
+        claim
+        for result in results
+        for claim in result.get("claims", [])[:1]
+    ]
+    finding_text = " ".join(
+        claim["claim"].strip().rstrip("。.")
+        + " "
+        + " ".join(
+            f"[{source_id}]" for source_id in claim["supporting_source_ids"]
+        )
+        for claim in representative_claims
+    )
     if _uses_chinese(research_topic):
-        return (
+        overview = (
             f"本报告基于经过审计的结论—证据记录，综合了 {len(results)} 个调研维度。"
             f"其中 {completed} 个维度达到配置的完成标准；其余证据限制在对应章节中披露。"
         )
-    return (
+        return overview + (f"综合现有证据，{finding_text}。" if finding_text else "")
+    overview = (
         f"This report synthesizes {len(results)} research dimensions from audited "
         f"claim–evidence records. {completed} dimension(s) met the configured "
         "completion criteria; remaining limitations are disclosed in their sections."
+    )
+    return overview + (f" Taken together, {finding_text}." if finding_text else "")
+
+
+def _deterministic_report_conclusion(
+    results: list[DimensionResult], research_topic: str
+) -> str:
+    """Conclude safely from representative audited claims when generation fails."""
+    representative_claims = [
+        claim
+        for result in results
+        for claim in result.get("claims", [])[-1:]
+    ]
+    findings = " ".join(
+        claim["claim"].strip().rstrip("。.")
+        + " "
+        + " ".join(
+            f"[{source_id}]" for source_id in claim["supporting_source_ids"]
+        )
+        for claim in representative_claims
+    )
+    if _uses_chinese(research_topic):
+        return (
+            (f"综合各维度，{findings}。" if findings else "现有证据不足以形成综合结论。")
+            + "这些结论仅以通过审计的证据为边界，尚未关闭的缺口应作为后续研究重点。"
+        )
+    return (
+        (f"Across the dimensions, {findings}. " if findings else "The available evidence does not support an integrated conclusion. ")
+        + "These conclusions remain bounded by the audited evidence, and unresolved gaps should guide further research."
     )
 
 
@@ -3674,6 +4179,8 @@ def _generate_report_section(
     model: str,
     research_run_id: str,
     conflicts: list[dict],
+    report_plan: dict,
+    previous_context: str = "None; this is the first body section.",
 ) -> str:
     """Generate one bounded section with compact retry and deterministic fallback."""
     dimension = result["dimension"]
@@ -3682,12 +4189,23 @@ def _generate_report_section(
         max_claims_per_dimension=max(1, len(result.get("claims", []))),
         max_evidence_chars=220,
     )
+    section_plan = next(
+        (
+            section
+            for section in report_plan.get("sections", [])
+            if str(section.get("dimension_id", "")) == str(dimension["id"])
+        ),
+        {},
+    )
 
     def prompt_for(section_material: str) -> str:
         return report_section_instructions.format(
             research_topic=research_topic,
             dimension_title=dimension["title"],
             dimension_scope=dimension["scope"],
+            report_plan=json.dumps(report_plan, ensure_ascii=False),
+            section_plan=json.dumps(section_plan, ensure_ascii=False),
+            previous_context=previous_context,
             dimension_research=section_material,
         ) + (
             "\n\nCross-claim conflict ledger:\n"
@@ -3747,34 +4265,89 @@ def _generate_report_section(
     return content
 
 
+def _generate_report_conclusion(
+    results: list[DimensionResult],
+    research_topic: str,
+    model: str,
+    research_run_id: str,
+    report_plan: dict,
+) -> str:
+    """Generate a bounded cross-dimension conclusion from audited claims."""
+    material = format_dimension_results(
+        results, max_claims_per_dimension=3, max_evidence_chars=100
+    )
+    prompt = report_conclusion_instructions.format(
+        research_topic=research_topic,
+        report_plan=json.dumps(report_plan, ensure_ascii=False),
+        dimension_research=material,
+    )
+    try:
+        conclusion = str(create_deepseek_model(model).invoke(prompt).content).strip()
+    except LengthFinishReasonError:
+        conclusion = ""
+    if not conclusion:
+        conclusion = _deterministic_report_conclusion(results, research_topic)
+        emit_research_event(
+            "report_conclusion_fallback",
+            research_run_id=research_run_id,
+            reason="length_limit_or_empty_response",
+        )
+    return conclusion
+
+
 def _generate_sectioned_report(
     results: list[DimensionResult],
     research_topic: str,
     model: str,
     research_run_id: str,
     conflicts: list[dict],
-) -> tuple[str, str, list[dict]]:
+    report_plan: dict,
+) -> tuple[str, str, list[dict], str]:
     """Generate bounded semantic sections and merge them without an LLM call."""
     emit_research_event(
         "report_sectioning_started",
         research_run_id=research_run_id,
         dimension_count=len(results),
     )
-    sections = [
-        {
-            "dimension_id": result["dimension"]["id"],
-            "title": result["dimension"]["title"],
-            "content": _generate_report_section(
-                result, research_topic, model, research_run_id, conflicts
+    results = _order_results_by_report_plan(results, report_plan)
+    sections = []
+    previous_context = "None; this is the first body section."
+    for result in results:
+        content = _generate_report_section(
+            result,
+            research_topic,
+            model,
+            research_run_id,
+            conflicts,
+            report_plan,
+            previous_context,
+        )
+        sections.append(
+            {
+                "dimension_id": result["dimension"]["id"],
+                "title": result["dimension"]["title"],
+                "content": content,
+            }
+        )
+        completed_plan = next(
+            (
+                section
+                for section in report_plan.get("sections", [])
+                if str(section.get("dimension_id", ""))
+                == str(result["dimension"]["id"])
             ),
-        }
-        for result in results
-    ]
+            {},
+        )
+        previous_context = (
+            f"Previous section: {result['dimension']['title']}. "
+            f"Editorial objective: {completed_plan.get('objective', result['dimension']['scope'])}."
+        )
     overview_material = format_dimension_results(
         results, max_claims_per_dimension=3, max_evidence_chars=100
     )
     overview_prompt = report_overview_instructions.format(
         research_topic=research_topic,
+        report_plan=json.dumps(report_plan, ensure_ascii=False),
         dimension_research=overview_material,
     ) + (
         "\n\nCross-claim conflict ledger:\n"
@@ -3800,18 +4373,26 @@ def _generate_sectioned_report(
             research_run_id=research_run_id,
             reason="empty_response",
         )
-    report = _assemble_sectioned_report(research_topic, overview, sections)
+    conclusion = _generate_report_conclusion(
+        results, research_topic, model, research_run_id, report_plan
+    )
+    report = _assemble_sectioned_report(
+        research_topic, overview, sections, conclusion
+    )
     emit_research_event(
         "report_draft_sectioned",
         research_run_id=research_run_id,
         section_count=len(sections),
         character_count=len(report),
     )
-    return report, overview, sections
+    return report, overview, sections, conclusion
 
 
 def _assemble_sectioned_report(
-    research_topic: str, overview: str, sections: list[dict]
+    research_topic: str,
+    overview: str,
+    sections: list[dict],
+    conclusion: str = "",
 ) -> str:
     """Merge independently generated report parts without another model call."""
     if _uses_chinese(research_topic):
@@ -3821,6 +4402,9 @@ def _assemble_sectioned_report(
     report_parts.extend(
         f"## {section['title']}\n\n{section['content']}" for section in sections
     )
+    if conclusion:
+        heading = "结论" if _uses_chinese(research_topic) else "Conclusion"
+        report_parts.append(f"## {heading}\n\n{conclusion}")
     return "\n\n".join(report_parts)
 
 
@@ -3830,26 +4414,32 @@ def draft_report(state: OverallState, config: RunnableConfig):
     model = state.get("reasoning_model") or configurable.answer_model
     current_results, _, material = _report_research_material(state, configurable)
     conflicts = state.get("claim_conflicts", [])
+    report_plan = state.get("report_plan") or _fallback_report_plan(
+        current_results, state["normalized_research_topic"]
+    )
     emit_research_event("drafting_report", research_run_id=state["research_run_id"])
     if _report_requires_sectioning(current_results, material, configurable):
-        report_draft, overview, sections = _generate_sectioned_report(
+        report_draft, overview, sections, conclusion = _generate_sectioned_report(
             current_results,
             state["normalized_research_topic"],
             model,
             state["research_run_id"],
             conflicts,
+            report_plan,
         )
         return {
             "report_draft": report_draft,
             "report_generation_mode": "sectioned",
             "report_overview": overview,
             "report_sections": sections,
+            "report_conclusion": conclusion,
             "report_revision_count": 0,
             "max_report_revisions": configurable.max_report_revisions,
         }
     prompt = answer_instructions.format(
         current_date=get_current_date(),
         research_topic=state["normalized_research_topic"],
+        report_plan=json.dumps(report_plan, ensure_ascii=False),
         dimension_research=material,
     ) + (
         "\n\nCross-claim conflict ledger:\n"
@@ -3865,18 +4455,20 @@ def draft_report(state: OverallState, config: RunnableConfig):
             research_run_id=state["research_run_id"],
             reason="length_limit",
         )
-        report_draft, overview, sections = _generate_sectioned_report(
+        report_draft, overview, sections, conclusion = _generate_sectioned_report(
             current_results,
             state["normalized_research_topic"],
             model,
             state["research_run_id"],
             conflicts,
+            report_plan,
         )
         return {
             "report_draft": report_draft,
             "report_generation_mode": "sectioned",
             "report_overview": overview,
             "report_sections": sections,
+            "report_conclusion": conclusion,
             "report_revision_count": 0,
             "max_report_revisions": configurable.max_report_revisions,
         }
@@ -3887,18 +4479,20 @@ def draft_report(state: OverallState, config: RunnableConfig):
             research_run_id=state["research_run_id"],
             reason="empty_response",
         )
-        report_draft, overview, sections = _generate_sectioned_report(
+        report_draft, overview, sections, conclusion = _generate_sectioned_report(
             current_results,
             state["normalized_research_topic"],
             model,
             state["research_run_id"],
             conflicts,
+            report_plan,
         )
         return {
             "report_draft": report_draft,
             "report_generation_mode": "sectioned",
             "report_overview": overview,
             "report_sections": sections,
+            "report_conclusion": conclusion,
             "report_revision_count": 0,
             "max_report_revisions": configurable.max_report_revisions,
         }
@@ -3907,9 +4501,72 @@ def draft_report(state: OverallState, config: RunnableConfig):
         "report_generation_mode": "single_pass",
         "report_overview": "",
         "report_sections": [],
+        "report_conclusion": "",
         "report_revision_count": 0,
         "max_report_revisions": configurable.max_report_revisions,
     }
+
+
+def _report_article_style_findings(
+    draft: str, research_topic: str = ""
+) -> list[str]:
+    """Detect deterministic signs that a draft is an evidence inventory, not prose."""
+    lines = [line.strip() for line in draft.splitlines() if line.strip()]
+    body_lines = [line for line in lines if not line.startswith("#")]
+    bullet_lines = [
+        line for line in body_lines if re.match(r"^(?:[-*+] |\d+[.)]\s+)", line)
+    ]
+    findings = []
+    list_requested = any(
+        cue in research_topic.casefold()
+        for cue in (
+            "list",
+            "checklist",
+            "ranking",
+            "top ",
+            "列表",
+            "清单",
+            "排名",
+            "逐条",
+        )
+    )
+    if (
+        not list_requested
+        and len(bullet_lines) >= 4
+        and len(bullet_lines) / max(len(body_lines), 1) >= 0.3
+    ):
+        findings.append(
+            "The draft is dominated by bullet-like claim enumeration instead of connected prose."
+        )
+    paragraphs = [
+        re.sub(r"^#+\s*", "", paragraph.strip())
+        for paragraph in re.split(r"\n\s*\n", draft)
+        if paragraph.strip() and not paragraph.lstrip().startswith(("- ", "* ", "+ "))
+    ]
+    substantial_paragraphs = [
+        paragraph
+        for paragraph in paragraphs
+        if len(paragraph) >= 160 and "\n- " not in paragraph
+    ]
+    if len(draft) >= 1000 and len(substantial_paragraphs) < 3:
+        findings.append(
+            "The draft lacks enough developed prose paragraphs to form a coherent article."
+        )
+    repetitive_caveats = sum(
+        draft.casefold().count(phrase)
+        for phrase in (
+            "current evidence",
+            "available evidence",
+            "现有证据",
+            "现有材料",
+            "证据不足",
+        )
+    )
+    if repetitive_caveats >= 6:
+        findings.append(
+            "Evidence limitations are repeated excessively instead of being consolidated where they affect interpretation."
+        )
+    return findings
 
 
 def audit_report(state: OverallState, config: RunnableConfig):
@@ -3926,6 +4583,13 @@ def audit_report(state: OverallState, config: RunnableConfig):
     )
     prompt = report_audit_instructions.format(
         research_topic=state["normalized_research_topic"],
+        report_plan=json.dumps(
+            state.get("report_plan")
+            or _fallback_report_plan(
+                current_results, state["normalized_research_topic"]
+            ),
+            ensure_ascii=False,
+        ),
         dimension_research=material,
         draft_report=state["report_draft"],
         output_schema=json.dumps(ReportAudit.model_json_schema(), ensure_ascii=False),
@@ -3989,6 +4653,17 @@ def audit_report(state: OverallState, config: RunnableConfig):
         audit["revision_instructions"] = [
             *audit["revision_instructions"],
             "Remove citations that are not attached to the audited claim set.",
+        ]
+    style_findings = _report_article_style_findings(
+        state["report_draft"], state["normalized_research_topic"]
+    )
+    if style_findings:
+        audit["passes"] = False
+        audit["issues"] = [*audit["issues"], *style_findings]
+        audit["revision_instructions"] = [
+            *audit["revision_instructions"],
+            "Rewrite list-like fragments as developed paragraphs that synthesize related claims under the report plan's thesis.",
+            "Consolidate repetitive limitations and strengthen transitions between sections and paragraphs.",
         ]
 
     conflicts = state.get("claim_conflicts", [])
@@ -4115,6 +4790,8 @@ def build_safe_report(state: OverallState, config: RunnableConfig):
     configurable = Configuration.from_runnable_config(config)
     results, _, _ = _report_research_material(state, configurable)
     topic = state["normalized_research_topic"]
+    report_plan = state.get("report_plan") or _fallback_report_plan(results, topic)
+    results = _order_results_by_report_plan(results, report_plan)
     overview = _deterministic_report_overview(results, topic)
     sections = [
         {
@@ -4124,6 +4801,7 @@ def build_safe_report(state: OverallState, config: RunnableConfig):
         }
         for result in results
     ]
+    conclusion = _deterministic_report_conclusion(results, topic)
     conflicts = [
         item for item in state.get("claim_conflicts", []) if item.get("material")
     ]
@@ -4141,13 +4819,20 @@ def build_safe_report(state: OverallState, config: RunnableConfig):
                 f"[{source_id}]" for source_id in right.get("supporting_source_ids", [])
             )
             conflict_lines.append(
-                f"- {conflict['conflict_id']}: {left.get('claim', '')} {left_markers} / "
+                f"{conflict['conflict_id']} 涉及两项不能同时采信的结论："
+                if chinese
+                else f"{conflict['conflict_id']} concerns two findings that cannot both be accepted: "
+            )
+            conflict_lines[-1] += (
+                f"{left.get('claim', '')} {left_markers}；"
+                f"{right.get('claim', '')} {right_markers}。"
+                if chinese
+                else f"{left.get('claim', '')} {left_markers}; "
                 f"{right.get('claim', '')} {right_markers}. "
-                + (
-                    "现有合格证据存在冲突，无法安全地选择单一结论。"
-                    if chinese
-                    else "Accepted evidence conflicts; no single conclusion can be selected safely."
-                )
+            ) + (
+                "现有合格证据存在冲突，无法安全地选择单一结论。"
+                if chinese
+                else "Accepted evidence conflicts; no single conclusion can be selected safely."
             )
         sections.append(
             {
@@ -4155,10 +4840,10 @@ def build_safe_report(state: OverallState, config: RunnableConfig):
                 "title": "未解决的证据矛盾"
                 if chinese
                 else "Unresolved Evidence Conflicts",
-                "content": "\n".join(conflict_lines),
+                "content": "\n\n".join(conflict_lines),
             }
         )
-    report = _assemble_sectioned_report(topic, overview, sections)
+    report = _assemble_sectioned_report(topic, overview, sections, conclusion)
     analysis_complete = state.get("consistency_analysis_complete", True)
     consistency_audit = ReportConsistencyAudit(
         passes=analysis_complete,
@@ -4186,6 +4871,7 @@ def build_safe_report(state: OverallState, config: RunnableConfig):
         "report_generation_mode": "safe_fallback",
         "report_overview": overview,
         "report_sections": sections,
+        "report_conclusion": conclusion,
         "report_safe_fallback_used": True,
         "report_consistency_audit": consistency_audit,
     }
@@ -4241,6 +4927,9 @@ def _revise_sectioned_report(
     research_run_id = state["research_run_id"]
     audit_findings = json.dumps(state["report_audit"], ensure_ascii=False)
     conflict_context = _format_conflict_ledger(state.get("claim_conflicts", []))
+    report_plan = state.get("report_plan") or _fallback_report_plan(
+        current_results, research_topic
+    )
     results_by_id = {result["dimension"]["id"]: result for result in current_results}
     revised_sections = []
     for section in state.get("report_sections", []):
@@ -4258,6 +4947,7 @@ def _revise_sectioned_report(
             research_topic=research_topic,
             dimension_title=dimension["title"],
             dimension_scope=dimension["scope"],
+            report_plan=json.dumps(report_plan, ensure_ascii=False),
             dimension_research=material,
             current_section=section.get("content", ""),
             audit_findings=audit_findings,
@@ -4286,6 +4976,7 @@ def _revise_sectioned_report(
     current_overview = state.get("report_overview", "")
     overview_prompt = report_overview_revision_instructions.format(
         research_topic=research_topic,
+        report_plan=json.dumps(report_plan, ensure_ascii=False),
         dimension_research=overview_material,
         current_overview=current_overview,
         audit_findings=audit_findings,
@@ -4303,8 +4994,24 @@ def _revise_sectioned_report(
         research_run_id=research_run_id,
         event_prefix="report_overview_revision",
     )
+    current_conclusion = state.get("report_conclusion", "")
+    conclusion_prompt = report_conclusion_revision_instructions.format(
+        research_topic=research_topic,
+        report_plan=json.dumps(report_plan, ensure_ascii=False),
+        dimension_research=overview_material,
+        current_conclusion=current_conclusion,
+        audit_findings=audit_findings,
+    )
+    revised_conclusion = _bounded_report_part_revision(
+        prompt=conclusion_prompt,
+        fallback=current_conclusion
+        or _deterministic_report_conclusion(current_results, research_topic),
+        model=model,
+        research_run_id=research_run_id,
+        event_prefix="report_conclusion_revision",
+    )
     revised_report = _assemble_sectioned_report(
-        research_topic, revised_overview, revised_sections
+        research_topic, revised_overview, revised_sections, revised_conclusion
     )
     emit_research_event(
         "report_sections_revised",
@@ -4316,6 +5023,7 @@ def _revise_sectioned_report(
         "report_draft": revised_report,
         "report_overview": revised_overview,
         "report_sections": revised_sections,
+        "report_conclusion": revised_conclusion,
         "report_generation_mode": "sectioned",
         "report_revision_count": state.get("report_revision_count", 0) + 1,
     }
@@ -4335,6 +5043,13 @@ def revise_report(state: OverallState, config: RunnableConfig):
     )
     prompt = report_revision_instructions.format(
         research_topic=state["normalized_research_topic"],
+        report_plan=json.dumps(
+            state.get("report_plan")
+            or _fallback_report_plan(
+                current_results, state["normalized_research_topic"]
+            ),
+            ensure_ascii=False,
+        ),
         dimension_research=material,
         draft_report=state["report_draft"],
         audit_findings=json.dumps(state["report_audit"], ensure_ascii=False),
@@ -4395,6 +5110,7 @@ builder.add_node("review_research_dimensions", review_research_dimensions)
 builder.add_node("research_dimension", research_dimension)
 builder.add_node("prepare_report_evidence", prepare_report_evidence)
 builder.add_node("detect_claim_conflicts", detect_claim_conflicts)
+builder.add_node("generate_report_plan", generate_report_plan)
 builder.add_node("draft_report", draft_report)
 builder.add_node("audit_report", audit_report)
 builder.add_node("revise_report", revise_report)
@@ -4420,7 +5136,8 @@ builder.add_conditional_edges(
 )
 builder.add_edge("research_dimension", "prepare_report_evidence")
 builder.add_edge("prepare_report_evidence", "detect_claim_conflicts")
-builder.add_edge("detect_claim_conflicts", "draft_report")
+builder.add_edge("detect_claim_conflicts", "generate_report_plan")
+builder.add_edge("generate_report_plan", "draft_report")
 builder.add_edge("draft_report", "audit_report")
 builder.add_conditional_edges(
     "audit_report",

@@ -61,8 +61,9 @@ def test_deterministic_evaluator_scores_valid_evidence_and_trajectory():
         "claims_extracted",
         "final_gap_ledger_audited",
         "report_evidence_prepared",
-        "claim_conflicts_detected",
-        "drafting_report",
+            "claim_conflicts_detected",
+            "report_plan_created",
+            "drafting_report",
         "report_audit_completed",
         "report_consistency_audited",
         "finalizing_answer",
@@ -601,6 +602,24 @@ def test_runner_rejects_deadlocking_or_empty_settings():
         "target_retries": 1,
     }
     validate_args(SimpleNamespace(**base))
+
+    with pytest.raises(ValueError, match="reflection-soft-limit"):
+        validate_args(
+            SimpleNamespace(
+                **base,
+                reflection_soft_limit=0,
+                reflection_hard_limit=3,
+            )
+        )
+
+    with pytest.raises(ValueError, match="reflection-hard-limit"):
+        validate_args(
+            SimpleNamespace(
+                **base,
+                reflection_soft_limit=3,
+                reflection_hard_limit=2,
+            )
+        )
     with pytest.raises(ValueError, match="concurrency"):
         validate_args(SimpleNamespace(**{**base, "concurrency": 0}))
     with pytest.raises(ValueError, match="target-retries"):

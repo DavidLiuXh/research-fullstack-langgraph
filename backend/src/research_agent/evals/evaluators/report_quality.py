@@ -16,10 +16,13 @@ weak sources, missing counterarguments, and failure to follow the request.
 
 Criteria:
 - relevance: directly answers the request
-- structure: coherent, readable, non-repetitive organization
+- structure: a coherent article with a central thesis, developed prose paragraphs,
+  logical transitions, and an integrated conclusion; penalize claim-by-claim lists
+  and repetitive section summaries unless the user explicitly requested a list
 - completeness: covers material expected topics and requirements
 - source_quality: uses authoritative and diverse sources appropriately
-- analytical_rigor: synthesizes evidence, resolves conflicts, and explains implications
+- analytical_rigor: relates multiple findings through chronology, causality,
+  comparison, or implications instead of merely enumerating evidence
 - balance_and_objectivity: represents uncertainty and material counterevidence
 
 Return JSON matching this schema:
