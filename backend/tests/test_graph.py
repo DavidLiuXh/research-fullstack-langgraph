@@ -2460,6 +2460,88 @@ def test_report_audit_route_is_bounded():
     )
 
 
+@pytest.mark.parametrize("sectioned", [False, True])
+def test_report_generation_and_revision_keep_pinned_language(monkeypatch, sectioned):
+    module = importlib.import_module("research_agent.graph")
+    prompts = []
+
+    class Model:
+        def invoke(self, prompt):
+            prompts.append(prompt)
+            return AIMessage(content="这是经过审计的报告正文 [S0-0]。")
+
+    monkeypatch.setattr(module, "create_deepseek_model", lambda *a, **k: Model())
+    monkeypatch.setattr(module, "emit_research_event", lambda *a, **k: None)
+    state = {**_report_state(dimensions=1, claims_per_dimension=4), "language_reference": "请调研行业风险"}
+    config = {"configurable": {"report_sectioning_claim_threshold": 4 if sectioned else 100}}
+    result = draft_report(state, config)
+    if sectioned:
+        assert result["report_draft"].startswith("# 调研报告")
+    assert len(prompts) == (3 if sectioned else 1)
+    revision = revise_report({**state, **result, "report_audit": {"revision_instructions": ["Improve prose"]}}, config)
+    assert "报告正文" in revision["report_draft"]
+    assert len(prompts) == (6 if sectioned else 2)
+    assert all('User language reference: "请调研行业风险"' in prompt for prompt in prompts)
+    assert all("Verified evidence for claim" in prompt for prompt in prompts)
+
+
+def test_report_length_fallback_uses_request_language(monkeypatch):
+    module = importlib.import_module("research_agent.graph")
+
+    class LengthError(Exception):
+        pass
+
+    class Model:
+        def invoke(self, prompt):
+            assert 'User language reference: "请调研行业风险"' in prompt
+            raise LengthError()
+
+    monkeypatch.setattr(module, "LengthFinishReasonError", LengthError)
+    monkeypatch.setattr(module, "create_deepseek_model", lambda *a, **k: Model())
+    monkeypatch.setattr(module, "emit_research_event", lambda *a, **k: None)
+    state = {**_report_state(dimensions=1), "language_reference": "请调研行业风险"}
+    result = draft_report(state, {})
+    assert result["report_draft"].startswith("# 调研报告")
+    assert "## 结论" in result["report_draft"]
+    assert "[S0-0]" in result["report_draft"]
+    safe = build_safe_report(state, {})
+    assert safe["report_draft"].startswith("# 调研报告")
+
+
+def test_language_reference_is_sent_to_every_dimension():
+    state = {
+        "normalized_research_topic": "English normalized context",
+        "language_reference": "请调研行业风险",
+        "research_run_id": "run",
+        "research_dimensions": [{"id": str(i), "title": "维度", "scope": "范围"} for i in range(3)],
+    }
+    sends = dispatch_research_dimensions(state)
+    assert len(sends) == 3
+    assert all(send.arg["language_reference"] == state["language_reference"] for send in sends)
+
+
+def test_human_review_messages_follow_request_language(monkeypatch):
+    module = importlib.import_module("research_agent.graph")
+    payloads = []
+
+    def capture(payload):
+        payloads.append(payload)
+        return {"approved": True, "action": "accept_assumptions"}
+
+    monkeypatch.setattr(module, "interrupt", capture)
+    monkeypatch.setattr(module, "emit_research_event", lambda *a, **k: None)
+    state = {
+        "language_reference": "请调研行业风险", "research_run_id": "run",
+        "research_dimensions": [], "topic_ambiguities": [],
+        "topic_clarification_questions": [], "topic_assumptions": [], "topic_clarification_reason": "",
+    }
+    review_research_dimensions(state)
+    clarification = request_topic_clarification(state)
+    assert "确认" in payloads[0]["message"]
+    assert "澄清" in payloads[1]["message"]
+    assert clarification["topic_clarification_history"][0]["response"] == "已接受建议的假设。"
+
+
 def test_small_report_uses_single_pass_drafting(monkeypatch):
     graph_module = importlib.import_module("research_agent.graph")
 
@@ -2798,6 +2880,29 @@ def test_report_audit_rejects_unknown_source_markers(monkeypatch):
 
     assert result["report_audit"]["passes"] is False
     assert "Sinvented" in result["report_audit"]["issues"][0]
+
+
+def test_report_audit_rejects_wrong_language_even_when_model_passes(monkeypatch):
+    module = importlib.import_module("research_agent.graph")
+
+    class PassingModel:
+        def with_structured_output(self, schema, method):
+            self.schema = schema
+            return self
+
+        def invoke(self, prompt):
+            assert 'User language reference: "请研究行业风险"' in prompt
+            return self.schema(passes=True, issues=[], revision_instructions=[])
+
+    monkeypatch.setattr(module, "create_deepseek_model", lambda *a, **k: PassingModel())
+    monkeypatch.setattr(module, "emit_research_event", lambda *a, **k: None)
+    result = audit_report({
+        **_report_state(dimensions=1),
+        "language_reference": "请研究行业风险",
+        "report_draft": "# 调研报告\n\n" + "The findings describe industry risk and its limitations. " * 8,
+    }, {})
+    assert result["report_audit"]["passes"] is False
+    assert any("中文" in issue for issue in result["report_audit"]["issues"])
 
 
 def test_report_audit_length_limit_uses_conservative_fallback(monkeypatch):

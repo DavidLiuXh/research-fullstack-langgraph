@@ -103,6 +103,7 @@ class DimensionResult(TypedDict):
 
 
 class OverallState(TypedDict):
+    language_reference: NotRequired[str]
     messages: Annotated[list, add_messages]
     original_research_topic: str
     normalized_research_topic: str
@@ -143,6 +144,7 @@ class OverallState(TypedDict):
 
 
 class DimensionState(TypedDict):
+    language_reference: NotRequired[str]
     research_run_id: str
     research_topic: str
     dimension: ResearchDimension
@@ -191,6 +193,7 @@ class DimensionState(TypedDict):
 
 
 class DimensionInput(TypedDict):
+    language_reference: NotRequired[str]
     research_run_id: str
     research_topic: str
     dimension: ResearchDimension

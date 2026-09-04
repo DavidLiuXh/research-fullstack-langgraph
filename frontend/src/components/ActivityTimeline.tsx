@@ -17,21 +17,26 @@ import {
   ChevronUp,
 } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { translate, type UiLanguage } from "@/lib/language";
 
 export interface ProcessedEvent {
+  language?: UiLanguage;
   title: string;
   data: unknown;
 }
 
 interface ActivityTimelineProps {
+  language?: UiLanguage;
   processedEvents: ProcessedEvent[];
   isLoading: boolean;
 }
 
 export function ActivityTimeline({
+  language = "en",
   processedEvents,
   isLoading,
 }: ActivityTimelineProps) {
+  const t = (key: string) => translate(processedEvents[0]?.language || language, key);
   const [isTimelineCollapsed, setIsTimelineCollapsed] =
     useState<boolean>(false);
   const timelineScrollAreaRef = useRef<HTMLDivElement>(null);
@@ -39,17 +44,17 @@ export function ActivityTimeline({
     if (index === 0 && isLoading && processedEvents.length === 0) {
       return <Loader2 className="h-4 w-4 text-neutral-400 animate-spin" />;
     }
-    if (title.toLowerCase().includes("generating")) {
+    if (/generating|生成查询|生成搜索/i.test(title)) {
       return <TextSearch className="h-4 w-4 text-neutral-400" />;
-    } else if (title.toLowerCase().includes("dimension")) {
+    } else if (/dimension|维度/i.test(title)) {
       return <Brain className="h-4 w-4 text-neutral-400" />;
     } else if (title.toLowerCase().includes("thinking")) {
       return <Loader2 className="h-4 w-4 text-neutral-400 animate-spin" />;
-    } else if (title.toLowerCase().includes("reflection")) {
+    } else if (/reflection|反思/i.test(title)) {
       return <Brain className="h-4 w-4 text-neutral-400" />;
-    } else if (title.toLowerCase().includes("research")) {
+    } else if (/research|网页|搜索/i.test(title)) {
       return <Search className="h-4 w-4 text-neutral-400" />;
-    } else if (title.toLowerCase().includes("finalizing")) {
+    } else if (/finalizing|报告/i.test(title)) {
       return <Pen className="h-4 w-4 text-neutral-400" />;
     }
     return <Activity className="h-4 w-4 text-neutral-400" />;
@@ -82,7 +87,7 @@ export function ActivityTimeline({
             className="flex items-center justify-start text-sm w-full cursor-pointer gap-2 text-neutral-100"
             onClick={() => setIsTimelineCollapsed(!isTimelineCollapsed)}
           >
-            Research
+            {t("Research")}
             {isTimelineCollapsed ? (
               <ChevronDown className="h-4 w-4 mr-2" />
             ) : (
@@ -105,7 +110,7 @@ export function ActivityTimeline({
                 </div>
                 <div>
                   <p className="text-sm text-neutral-300 font-medium">
-                    Searching...
+                    {t("Searching...")}
                   </p>
                 </div>
               </div>
@@ -142,7 +147,7 @@ export function ActivityTimeline({
                     </div>
                     <div>
                       <p className="text-sm text-neutral-300 font-medium">
-                        Searching...
+                        {t("Searching...")}
                       </p>
                     </div>
                   </div>
@@ -151,9 +156,9 @@ export function ActivityTimeline({
             ) : !isLoading ? ( // Only show "No activity" if not loading and no events
               <div className="flex flex-col items-center justify-center h-full text-neutral-500 pt-10">
                 <Info className="h-6 w-6 mb-3" />
-                <p className="text-sm">No activity to display.</p>
+                <p className="text-sm">{t("No activity to display.")}</p>
                 <p className="text-xs text-neutral-600 mt-1">
-                  Timeline will update during processing.
+                  {t("Timeline will update during processing.")}
                 </p>
               </div>
             ) : null}
