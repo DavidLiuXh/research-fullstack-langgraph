@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { useState, ReactNode } from "react";
 import ReactMarkdown from "react-markdown";
 import { cn } from "@/lib/utils";
+import { translate, type UiLanguage } from "@/lib/language";
 import { Badge } from "@/components/ui/badge";
 import {
   ActivityTimeline,
@@ -160,6 +161,7 @@ const HumanMessageBubble: React.FC<HumanMessageBubbleProps> = ({
 
 // Props for AiMessageBubble
 interface AiMessageBubbleProps {
+  language: UiLanguage;
   message: Message;
   historicalActivity: ProcessedEvent[] | undefined;
   liveActivity: ProcessedEvent[] | undefined;
@@ -172,6 +174,7 @@ interface AiMessageBubbleProps {
 
 // AiMessageBubble Component
 const AiMessageBubble: React.FC<AiMessageBubbleProps> = ({
+  language,
   message,
   historicalActivity,
   liveActivity,
@@ -191,6 +194,7 @@ const AiMessageBubble: React.FC<AiMessageBubbleProps> = ({
       {activityForThisBubble && activityForThisBubble.length > 0 && (
         <div className="mb-3 border-b border-neutral-700 pb-3 text-xs">
           <ActivityTimeline
+            language={language}
             processedEvents={activityForThisBubble}
             isLoading={isLiveActivityForThisBubble}
           />
@@ -225,6 +229,7 @@ const AiMessageBubble: React.FC<AiMessageBubbleProps> = ({
 };
 
 interface ChatMessagesViewProps {
+  language: UiLanguage;
   messages: Message[];
   isLoading: boolean;
   scrollAreaRef: React.RefObject<HTMLDivElement | null>;
@@ -236,6 +241,7 @@ interface ChatMessagesViewProps {
 }
 
 export function ChatMessagesView({
+  language,
   messages,
   isLoading,
   scrollAreaRef,
@@ -276,6 +282,7 @@ export function ChatMessagesView({
                     />
                   ) : (
                     <AiMessageBubble
+                      language={language}
                       message={message}
                       historicalActivity={historicalActivities[message.id!]}
                       liveActivity={liveActivityEvents} // Pass global live events
@@ -300,6 +307,7 @@ export function ChatMessagesView({
                   {liveActivityEvents.length > 0 ? (
                     <div className="text-xs">
                       <ActivityTimeline
+                        language={language}
                         processedEvents={liveActivityEvents}
                         isLoading={true}
                       />
@@ -307,7 +315,7 @@ export function ChatMessagesView({
                   ) : (
                     <div className="flex items-center justify-start h-full">
                       <Loader2 className="h-5 w-5 animate-spin text-neutral-400 mr-2" />
-                      <span>Processing...</span>
+                      <span>{translate(language, "Searching...")}</span>
                     </div>
                   )}
                 </div>

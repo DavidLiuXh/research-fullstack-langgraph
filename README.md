@@ -26,10 +26,24 @@ research loop. This fork introduces the following changes:
 | Execution model | One research loop | One isolated subgraph per dimension, executed in parallel |
 | Reflection | Reflect on the overall search result | Reflect independently per dimension and return knowledge gaps to query generation |
 | Report composition | Draft directly from research output | Build a validated editorial plan, write connected sections with shared context, and audit article coherence |
+| Output language | Not consistently constrained | Pin the latest user question as the language reference across clarification, dimensions, subgraphs, reporting and revisions; bilingual Chinese/English progress and review UI |
 | Reliability | Search errors terminate the run | Tavily retries and individual-query failure degradation |
 | Progress UI | Top-level graph progress | Nested subgraph progress forwarded as custom stream events |
 | Result isolation | Shared accumulated state | Per-run IDs isolate sources and dimension results |
 | Browser continuity | In-memory frontend session | LangGraph thread ID persisted for page-reload recovery |
+
+### Language following
+
+Each new research run follows the language of the latest user question, rather
+than previous assistant messages or retrieved documents. The reference is saved
+in graph state, survives human-review pauses and thread restoration, and is sent
+to every parallel dimension. All model-generated prose (including clarification,
+gaps, reflection, report planning and revisions) receives the same language policy.
+Static progress/review UI and deterministic report scaffolding currently support
+Chinese and English; other languages are followed by the model, while static copy
+falls back to English. Obvious Chinese/English report-language mismatches trigger
+revision. Verbatim evidence quotes, citation IDs, URLs and schema enums remain
+unchanged; search queries may use another language to retrieve better sources.
 
 Additional frontend improvements include topic clarification and dimension
 review dialogs, readable dark-theme controls, an auto-scrolling activity

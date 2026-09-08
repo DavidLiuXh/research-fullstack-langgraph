@@ -31,6 +31,14 @@ from openai import LengthFinishReasonError
 from tavily import TavilyClient
 
 from research_agent.configuration import Configuration
+from research_agent.language import (
+    format_research_prompt,
+    language_reference,
+    latest_user_text,
+    local_text,
+    report_language_issue,
+    uses_chinese,
+)
 from research_agent.llm import create_deepseek_model
 from research_agent.prompts import (
     answer_instructions,
@@ -469,6 +477,7 @@ def initialize_research_topic(state: OverallState):
     topic = get_research_topic(state["messages"])
     return {
         "original_research_topic": topic,
+        "language_reference": latest_user_text(state["messages"]) or topic,
         "normalized_research_topic": topic,
         "topic_needs_clarification": False,
         "topic_ambiguities": [],
@@ -493,7 +502,8 @@ def analyze_research_topic(state: OverallState, config: RunnableConfig):
         )
         or "None; this is the first assessment."
     )
-    prompt = topic_clarification_instructions.format(
+    prompt = format_research_prompt(
+        topic_clarification_instructions, language_context=state,
         original_topic=state["original_research_topic"],
         clarification_history=history_text,
     )
@@ -535,7 +545,8 @@ def request_topic_clarification(state: OverallState):
     decision = interrupt(
         {
             "type": "research_topic_clarification",
-            "message": "Clarify the research topic before planning begins.",
+            "message": local_text(state, "Clarify the research topic before planning begins.", "开始规划前，请先澄清调研主题。"),
+            "language_reference": language_reference(state),
             "ambiguities": state["topic_ambiguities"],
             "questions": state["topic_clarification_questions"],
             "assumptions": state["topic_assumptions"],
@@ -549,7 +560,7 @@ def request_topic_clarification(state: OverallState):
         raise ValueError("Topic clarification action is invalid")
 
     if action == "accept_assumptions":
-        response = "Accepted the proposed assumptions."
+        response = local_text(state, "Accepted the proposed assumptions.", "已接受建议的假设。")
         needs_clarification = False
     else:
         response = str(decision.get("response", "")).strip()
@@ -586,8 +597,9 @@ def generate_research_dimensions(state: OverallState, config: RunnableConfig):
     configurable = Configuration.from_runnable_config(config)
     topic = state["normalized_research_topic"]
     research_run_id = uuid4().hex[:12]
-    emit_research_event("planning_dimensions", message="Planning research dimensions")
-    prompt = dimension_instructions.format(
+    emit_research_event("planning_dimensions", message=local_text(state, "Planning research dimensions", "正在规划调研维度"))
+    prompt = format_research_prompt(
+        dimension_instructions, language_context=state,
         current_date=get_current_date(),
         number_dimensions=configurable.number_of_research_dimensions,
         research_topic=topic,
@@ -626,7 +638,8 @@ def review_research_dimensions(state: OverallState):
             "type": "research_dimension_review",
             "research_run_id": state["research_run_id"],
             "dimensions": state["research_dimensions"],
-            "message": "Review the proposed research dimensions before research begins.",
+            "message": local_text(state, "Review the proposed research dimensions before research begins.", "开始调研前，请确认以下调研维度。"),
+            "language_reference": language_reference(state),
         }
     )
     if not isinstance(decision, dict) or not isinstance(decision.get("approved"), bool):
@@ -660,6 +673,7 @@ def dispatch_research_dimensions(state: OverallState):
     for dimension in state["research_dimensions"]:
         dimension_input = {
             "research_topic": topic,
+            "language_reference": language_reference(state),
             "research_run_id": state["research_run_id"],
             "dimension": dimension,
             "initial_search_query_count": state.get("initial_search_query_count", 3),
@@ -700,7 +714,8 @@ def _operational_gap(gap: Mapping[str, Any], *, origin: str) -> dict[str, Any]:
 def plan_initial_gaps(state: DimensionState, config: RunnableConfig):
     """Plan concrete evidence gaps before selecting the first research target."""
     configurable = Configuration.from_runnable_config(config)
-    prompt = initial_gap_planning_instructions.format(
+    prompt = format_research_prompt(
+        initial_gap_planning_instructions, language_context=state,
         number_gaps=configurable.max_initial_gaps_per_dimension,
         research_topic=state["research_topic"],
         dimension_title=state["dimension"]["title"],
@@ -730,7 +745,7 @@ def plan_initial_gaps(state: DimensionState, config: RunnableConfig):
             ResearchGap(
                 gap_id=f"{state['dimension']['id']}-initial-scope",
                 question=state["dimension"]["scope"],
-                reason="Structured initial gap planning failed; the full dimension scope remains open.",
+                reason=local_text(state, "Structured initial gap planning failed; the full dimension scope remains open.", "初始缺口规划失败，完整维度范围仍待调研。"),
                 priority="high",
                 required_source_types=_default_source_types(
                     state["research_topic"], state["dimension"]
@@ -911,7 +926,8 @@ def generate_query(
     missing_source_types = sorted(
         set(required_source_types) - set(covered_source_types)
     )
-    prompt = query_writer_instructions.format(
+    prompt = format_research_prompt(
+        query_writer_instructions, language_context=state,
         current_date=get_current_date(),
         research_topic=state["research_topic"],
         dimension_title=state["dimension"]["title"],
@@ -1213,7 +1229,8 @@ def evaluate_sources(state: DimensionState, config: RunnableConfig):
             "rejected_sources": [],
         }
 
-    prompt = source_evaluation_instructions.format(
+    prompt = format_research_prompt(
+        source_evaluation_instructions, language_context=state,
         research_topic=state["research_topic"],
         dimension_title=state["dimension"]["title"],
         dimension_scope=state["dimension"]["scope"],
@@ -1502,7 +1519,8 @@ def assess_gap_evidence(state: DimensionState, config: RunnableConfig):
         )
         assessment_status = "deterministic_quality_check"
     elif accepted:
-        prompt = gap_evidence_assessment_instructions.format(
+        prompt = format_research_prompt(
+            gap_evidence_assessment_instructions, language_context=state,
             research_topic=state["research_topic"],
             dimension_title=state["dimension"]["title"],
             active_gap=json.dumps(gap, ensure_ascii=False),
@@ -2073,28 +2091,30 @@ def replan_search(state: DimensionState, config: RunnableConfig):
     level = int(gap.get("strategy_level", 0)) + 1
     blockers = gap.get("closure_blockers", [])
     blocker_guidance = {
-        "missing_direct_evidence": "Search the exact expected fact, metric, date, unit, or quoted statement instead of broad topic coverage.",
-        "missing_supported_claim": "Target documents containing extractable factual statements and data, not landing pages or summaries.",
-        "missing_requested_source_type": "Target the still-missing requested source type and name likely official institutions explicitly.",
-        "insufficient_independent_sources": "Exclude already saturated publisher domains and find an independent organization confirming the evidence.",
-        "unresolved_contradiction": "Search primary documents that define scope, date, unit, and methodology needed to reconcile the contradiction.",
+        "missing_direct_evidence": local_text(state, "Search the exact expected fact, metric, date, unit, or quoted statement instead of broad topic coverage.", "围绕具体事实、指标、日期、单位或原文陈述搜索，避免泛泛覆盖主题。"),
+        "missing_supported_claim": local_text(state, "Target documents containing extractable factual statements and data, not landing pages or summaries.", "查找含可提取事实与数据的文档，避免首页或概要页面。"),
+        "missing_requested_source_type": local_text(state, "Target the still-missing requested source type and name likely official institutions explicitly.", "针对仍缺少的来源类型搜索，并明确可能的官方机构名称。"),
+        "insufficient_independent_sources": local_text(state, "Exclude already saturated publisher domains and find an independent organization confirming the evidence.", "排除已饱和的发布域名，寻找独立机构交叉验证。"),
+        "unresolved_contradiction": local_text(state, "Search primary documents that define scope, date, unit, and methodology needed to reconcile the contradiction.", "查找定义范围、日期、单位与方法的一手文档，以核实矛盾。"),
     }
     generic_strategies = {
-        1: "Target named authoritative institutions and restrict queries to their domains.",
-        2: "Search for the original document, dataset, publication title, author, and date.",
-        3: "Split the evidence requirement into narrower factual subquestions and use source-specific terminology.",
+        1: local_text(state, "Target named authoritative institutions and restrict queries to their domains.", "指定权威机构并限定其域名检索。"),
+        2: local_text(state, "Search for the original document, dataset, publication title, author, and date.", "按原始文档、数据集、出版物标题、作者与日期检索。"),
+        3: local_text(state, "Split the evidence requirement into narrower factual subquestions and use source-specific terminology.", "将证据要求拆成更具体的事实问题，并使用来源的专业术语。"),
     }
     guidance_parts = [
         blocker_guidance[blocker] for blocker in blockers if blocker in blocker_guidance
     ]
     scope_guidance = {
-        "temporal_scope_mismatch": (
+        "temporal_scope_mismatch": local_text(state,
             "Include the exact required year or horizon in every query and reject "
-            "documents whose quoted facts only cover earlier periods."
+            "documents whose quoted facts only cover earlier periods.",
+            "每条查询都应包含要求的年份或时间范围，排除仅覆盖更早时期的事实。",
         ),
-        "semantic_scope_mismatch": (
+        "semantic_scope_mismatch": local_text(state,
             "Search the exact unresolved subquestion and its required metric or "
-            "policy instrument, not the broader topic."
+            "policy instrument, not the broader topic.",
+            "围绕尚未解决的具体子问题及其指标或政策工具搜索，避免泛化主题。",
         ),
     }
     guidance_parts.extend(
@@ -2106,7 +2126,7 @@ def replan_search(state: DimensionState, config: RunnableConfig):
         guidance_parts = [
             generic_strategies.get(
                 level,
-                "Use exact phrases, multilingual terminology, and archival or bibliographic discovery queries.",
+                local_text(state, "Use exact phrases, multilingual terminology, and archival or bibliographic discovery queries.", "使用精确短语、多语言术语以及档案或书目检索。"),
             )
         ]
     domain_counts: dict[str, int] = {}
@@ -2123,7 +2143,7 @@ def replan_search(state: DimensionState, config: RunnableConfig):
     )
     if saturated_domains:
         guidance_parts.append(
-            "Do not target these saturated domains: " + ", ".join(saturated_domains)
+            local_text(state, "Do not target these saturated domains: ", "避免检索以下已饱和域名：") + ", ".join(saturated_domains)
         )
     guidance = " ".join(dict.fromkeys(guidance_parts))
     gap["strategy_level"] = level
@@ -2155,12 +2175,12 @@ def _quality_requirement_gaps(
         gaps.append(
             ResearchGap(
                 gap_id="quality-accepted-sources",
-                question="Which additional independent sources directly support this dimension?",
-                reason="The minimum accepted-source requirement has not been met.",
+                question=local_text(state, "Which additional independent sources directly support this dimension?", "还有哪些独立来源能直接支持此维度？"),
+                reason=local_text(state, "The minimum accepted-source requirement has not been met.", "尚未满足最低合格来源数量要求。"),
                 priority="high",
                 required_source_types=sorted(AUTHORITATIVE_SOURCE_TYPES),
-                expected_evidence="Direct, independent evidence from an accepted source.",
-                suggested_query_focus="Find independent authoritative evidence for this dimension.",
+                expected_evidence=local_text(state, "Direct, independent evidence from an accepted source.", "来自合格来源的直接、独立证据。"),
+                suggested_query_focus=local_text(state, "Find independent authoritative evidence for this dimension.", "为此维度查找独立的权威证据。"),
             )
         )
     if (
@@ -2170,12 +2190,12 @@ def _quality_requirement_gaps(
         gaps.append(
             ResearchGap(
                 gap_id="quality-authoritative-source",
-                question="What authoritative source directly supports this dimension?",
-                reason="The authoritative-source requirement has not been met.",
+                question=local_text(state, "What authoritative source directly supports this dimension?", "哪些权威来源能直接支持此维度？"),
+                reason=local_text(state, "The authoritative-source requirement has not been met.", "尚未满足权威来源要求。"),
                 priority="high",
                 required_source_types=sorted(AUTHORITATIVE_SOURCE_TYPES),
-                expected_evidence="A direct statement or data point from an authoritative source.",
-                suggested_query_focus="Search official, academic, standards, or institutional sources.",
+                expected_evidence=local_text(state, "A direct statement or data point from an authoritative source.", "来自权威来源的直接陈述或数据。"),
+                suggested_query_focus=local_text(state, "Search official, academic, standards, or institutional sources.", "检索官方、学术、标准或机构来源。"),
             )
         )
     if (
@@ -2185,8 +2205,8 @@ def _quality_requirement_gaps(
         gaps.append(
             ResearchGap(
                 gap_id="quality-primary-source",
-                question="What primary source directly supports this dimension?",
-                reason="The primary-source requirement has not been met.",
+                question=local_text(state, "What primary source directly supports this dimension?", "哪些一手来源能直接支持此维度？"),
+                reason=local_text(state, "The primary-source requirement has not been met.", "尚未满足一手来源要求。"),
                 priority="high",
                 required_source_types=[
                     "government",
@@ -2194,8 +2214,8 @@ def _quality_requirement_gaps(
                     "standards_body",
                     "academic",
                 ],
-                expected_evidence="First-party data, documentation, regulation, or original research.",
-                suggested_query_focus="Find the original official document, dataset, or publication.",
+                expected_evidence=local_text(state, "First-party data, documentation, regulation, or original research.", "一手数据、文档、法规或原创研究。"),
+                suggested_query_focus=local_text(state, "Find the original official document, dataset, or publication.", "查找原始官方文档、数据集或出版物。"),
             )
         )
     return gaps
@@ -2290,7 +2310,8 @@ def dimension_reflection(state: DimensionState, config: RunnableConfig):
             *state.get("rejected_sources", []),
         ]
     )
-    prompt = reflection_instructions.format(
+    prompt = format_research_prompt(
+        reflection_instructions, language_context=state,
         research_topic=state["research_topic"],
         dimension_title=state["dimension"]["title"],
         dimension_scope=state["dimension"]["scope"],
@@ -2333,8 +2354,8 @@ def dimension_reflection(state: DimensionState, config: RunnableConfig):
             missing_questions=[
                 ResearchGap(
                     gap_id="reflection-unresolved-evidence",
-                    question=f"What material evidence remains missing for {state['dimension']['title']}?",
-                    reason="The structured whole-dimension audit could not be parsed safely.",
+                    question=local_text(state, f"What material evidence remains missing for {state['dimension']['title']}?", f"{state['dimension']['title']}仍缺少哪些关键证据？"),
+                    reason=local_text(state, "The structured whole-dimension audit could not be parsed safely.", "无法可靠解析完整维度的审计结果。"),
                     priority="high",
                     required_source_types=_default_source_types(
                         state["research_topic"], state["dimension"]
@@ -2345,10 +2366,10 @@ def dimension_reflection(state: DimensionState, config: RunnableConfig):
             ],
             unsupported_claims=[],
             contradictions=[],
-            source_quality_issues=["Structured dimension reflection failed."],
+            source_quality_issues=[local_text(state, "Structured dimension reflection failed.", "维度反思结果解析失败。")],
             recommended_search_strategy=[],
             do_not_repeat=state.get("query_history", []),
-            completion_reason="The audit could not safely declare the dimension sufficient.",
+            completion_reason=local_text(state, "The audit could not safely declare the dimension sufficient.", "审计无法确认该维度的证据已充分。"),
             confidence=0,
         )
 
@@ -2368,14 +2389,14 @@ def dimension_reflection(state: DimensionState, config: RunnableConfig):
             _operational_gap(
                 ResearchGap(
                     gap_id="reflection-unresolved-evidence",
-                    question=f"What material evidence remains missing for {state['dimension']['title']}?",
+                    question=local_text(state, f"What material evidence remains missing for {state['dimension']['title']}?", f"{state['dimension']['title']}仍缺少哪些关键证据？"),
                     reason=result.completion_reason
-                    or "The dimension audit did not declare the evidence sufficient.",
+                    or local_text(state, "The dimension audit did not declare the evidence sufficient.", "维度审计尚未确认已有证据充分。"),
                     priority="high",
                     required_source_types=_default_source_types(
                         state["research_topic"], state["dimension"]
                     ),
-                    expected_evidence="Direct evidence that resolves the remaining dimension-level uncertainty.",
+                    expected_evidence=local_text(state, "Direct evidence that resolves the remaining dimension-level uncertainty.", "能够解决维度剩余不确定性的直接证据。"),
                     suggested_query_focus=(
                         result.recommended_search_strategy[0]
                         if result.recommended_search_strategy
@@ -2489,7 +2510,7 @@ def dimension_reflection(state: DimensionState, config: RunnableConfig):
             dict.fromkeys(
                 [
                     *assessment.get("source_quality_issues", []),
-                    "Deterministic minimum source requirements are not met.",
+                    local_text(state, "Deterministic minimum source requirements are not met.", "尚未满足最低来源要求。"),
                 ]
             )
         )
@@ -2711,7 +2732,7 @@ def extract_claims(state: DimensionState, config: RunnableConfig):
         )
         return {
             "claims": [],
-            "dimension_summary": "No claim was extracted because no quality-screened evidence was available.",
+            "dimension_summary": local_text(state, "No claim was extracted because no quality-screened evidence was available.", "没有通过质量筛选的证据，因此未提取结论。"),
         }
     source_by_id = {source["source_id"]: source for source in selected}
     gap_registry = state.get("gap_registry", {})
@@ -2736,7 +2757,8 @@ def extract_claims(state: DimensionState, config: RunnableConfig):
                 ledger_claims.append(validated)
 
     def build_prompt(sources, content_chars, max_claims):
-        return claim_extraction_instructions.format(
+        return format_research_prompt(
+            claim_extraction_instructions, language_context=state,
             research_topic=state["research_topic"],
             dimension_title=state["dimension"]["title"],
             dimension_scope=state["dimension"]["scope"],
@@ -3717,7 +3739,8 @@ def detect_claim_conflicts(state: OverallState, config: RunnableConfig):
         }
         for claim_id, claim in claims_by_id.items()
     ]
-    prompt = claim_conflict_instructions.format(
+    prompt = format_research_prompt(
+        claim_conflict_instructions, language_context=state,
         output_schema=json.dumps(
             ClaimConflictAnalysis.model_json_schema(), ensure_ascii=False
         ),
@@ -3942,7 +3965,8 @@ def generate_report_plan(state: OverallState, config: RunnableConfig):
         }
         for result in results
     ]
-    prompt = report_planning_instructions.format(
+    prompt = format_research_prompt(
+        report_planning_instructions, language_context=state,
         output_schema=json.dumps(ReportPlan.model_json_schema(), ensure_ascii=False),
         research_topic=topic,
         claim_catalog=json.dumps(claim_catalog, ensure_ascii=False),
@@ -3979,8 +4003,9 @@ def generate_report_plan(state: OverallState, config: RunnableConfig):
         research_run_id=state["research_run_id"],
         planning_mode=planning_mode,
         section_count=len(plan["sections"]),
-        thesis=plan["thesis"],
+        thesis=plan["thesis"] if planning_mode == "model" else local_text(state, "the audited findings", "已审计的结论"),
     )
+    plan["language_reference"] = language_reference(state)
     return {"report_plan": plan}
 
 
@@ -4026,7 +4051,7 @@ def _report_requires_sectioning(
 
 def _uses_chinese(text: str) -> bool:
     """Return whether user-facing report scaffolding should use Chinese."""
-    return bool(re.search(r"[\u3400-\u9fff]", text))
+    return uses_chinese(text)
 
 
 def _research_limitation_message(result: DimensionResult, *, chinese: bool) -> str:
@@ -4199,7 +4224,8 @@ def _generate_report_section(
     )
 
     def prompt_for(section_material: str) -> str:
-        return report_section_instructions.format(
+        return format_research_prompt(
+            report_section_instructions, language_context={"language_reference": report_plan.get("language_reference") or research_topic},
             research_topic=research_topic,
             dimension_title=dimension["title"],
             dimension_scope=dimension["scope"],
@@ -4241,7 +4267,7 @@ def _generate_report_section(
             response = create_deepseek_model(model).invoke(retry_prompt)
             content = str(response.content).strip()
         except LengthFinishReasonError:
-            content = _deterministic_report_section(result, research_topic)
+            content = _deterministic_report_section(result, report_plan.get("language_reference") or research_topic)
             emit_research_event(
                 "report_section_fallback",
                 research_run_id=research_run_id,
@@ -4249,7 +4275,7 @@ def _generate_report_section(
                 reason="length_limit",
             )
     if not content:
-        content = _deterministic_report_section(result, research_topic)
+        content = _deterministic_report_section(result, report_plan.get("language_reference") or research_topic)
         emit_research_event(
             "report_section_fallback",
             research_run_id=research_run_id,
@@ -4276,7 +4302,8 @@ def _generate_report_conclusion(
     material = format_dimension_results(
         results, max_claims_per_dimension=3, max_evidence_chars=100
     )
-    prompt = report_conclusion_instructions.format(
+    prompt = format_research_prompt(
+        report_conclusion_instructions, language_context={"language_reference": report_plan.get("language_reference") or research_topic},
         research_topic=research_topic,
         report_plan=json.dumps(report_plan, ensure_ascii=False),
         dimension_research=material,
@@ -4286,7 +4313,7 @@ def _generate_report_conclusion(
     except LengthFinishReasonError:
         conclusion = ""
     if not conclusion:
-        conclusion = _deterministic_report_conclusion(results, research_topic)
+        conclusion = _deterministic_report_conclusion(results, report_plan.get("language_reference") or research_topic)
         emit_research_event(
             "report_conclusion_fallback",
             research_run_id=research_run_id,
@@ -4345,7 +4372,8 @@ def _generate_sectioned_report(
     overview_material = format_dimension_results(
         results, max_claims_per_dimension=3, max_evidence_chars=100
     )
-    overview_prompt = report_overview_instructions.format(
+    overview_prompt = format_research_prompt(
+        report_overview_instructions, language_context={"language_reference": report_plan.get("language_reference") or research_topic},
         research_topic=research_topic,
         report_plan=json.dumps(report_plan, ensure_ascii=False),
         dimension_research=overview_material,
@@ -4360,14 +4388,14 @@ def _generate_sectioned_report(
             create_deepseek_model(model).invoke(overview_prompt).content
         ).strip()
     except LengthFinishReasonError:
-        overview = _deterministic_report_overview(results, research_topic)
+        overview = _deterministic_report_overview(results, report_plan.get("language_reference") or research_topic)
         emit_research_event(
             "report_overview_fallback",
             research_run_id=research_run_id,
             reason="length_limit",
         )
     if not overview:
-        overview = _deterministic_report_overview(results, research_topic)
+        overview = _deterministic_report_overview(results, report_plan.get("language_reference") or research_topic)
         emit_research_event(
             "report_overview_fallback",
             research_run_id=research_run_id,
@@ -4377,7 +4405,7 @@ def _generate_sectioned_report(
         results, research_topic, model, research_run_id, report_plan
     )
     report = _assemble_sectioned_report(
-        research_topic, overview, sections, conclusion
+        report_plan.get("language_reference") or research_topic, overview, sections, conclusion
     )
     emit_research_event(
         "report_draft_sectioned",
@@ -4417,6 +4445,7 @@ def draft_report(state: OverallState, config: RunnableConfig):
     report_plan = state.get("report_plan") or _fallback_report_plan(
         current_results, state["normalized_research_topic"]
     )
+    report_plan = {**report_plan, "language_reference": language_reference(state)}
     emit_research_event("drafting_report", research_run_id=state["research_run_id"])
     if _report_requires_sectioning(current_results, material, configurable):
         report_draft, overview, sections, conclusion = _generate_sectioned_report(
@@ -4436,7 +4465,8 @@ def draft_report(state: OverallState, config: RunnableConfig):
             "report_revision_count": 0,
             "max_report_revisions": configurable.max_report_revisions,
         }
-    prompt = answer_instructions.format(
+    prompt = format_research_prompt(
+        answer_instructions, language_context=state,
         current_date=get_current_date(),
         research_topic=state["normalized_research_topic"],
         report_plan=json.dumps(report_plan, ensure_ascii=False),
@@ -4581,7 +4611,8 @@ def audit_report(state: OverallState, config: RunnableConfig):
         max_claims_per_dimension=max(1, max_claims),
         max_evidence_chars=180,
     )
-    prompt = report_audit_instructions.format(
+    prompt = format_research_prompt(
+        report_audit_instructions, language_context=state,
         research_topic=state["normalized_research_topic"],
         report_plan=json.dumps(
             state.get("report_plan")
@@ -4630,6 +4661,11 @@ def audit_report(state: OverallState, config: RunnableConfig):
             reason=reason,
         )
     valid_ids = {source["source_id"] for source in sources}
+    language_issue = report_language_issue(state["report_draft"], language_reference(state))
+    if language_issue:
+        audit["passes"] = False
+        audit["issues"] = [*audit.get("issues", []), language_issue]
+        audit["revision_instructions"] = [*audit.get("revision_instructions", []), language_issue]
     claim_ids = _audited_claim_source_ids(current_results)
     cited_ids = set(re.findall(r"\[(S[A-Za-z0-9-]+)\]", state["report_draft"]))
     invalid_ids = sorted(cited_ids - valid_ids)
@@ -4667,7 +4703,8 @@ def audit_report(state: OverallState, config: RunnableConfig):
         ]
 
     conflicts = state.get("claim_conflicts", [])
-    conflict_prompt = report_consistency_audit_instructions.format(
+    conflict_prompt = format_research_prompt(
+        report_consistency_audit_instructions, language_context=state,
         output_schema=json.dumps(
             ReportConsistencyAudit.model_json_schema(), ensure_ascii=False
         ),
@@ -4792,22 +4829,22 @@ def build_safe_report(state: OverallState, config: RunnableConfig):
     topic = state["normalized_research_topic"]
     report_plan = state.get("report_plan") or _fallback_report_plan(results, topic)
     results = _order_results_by_report_plan(results, report_plan)
-    overview = _deterministic_report_overview(results, topic)
+    overview = _deterministic_report_overview(results, language_reference(state))
     sections = [
         {
             "dimension_id": result["dimension"]["id"],
             "title": result["dimension"]["title"],
-            "content": _deterministic_report_section(result, topic),
+            "content": _deterministic_report_section(result, language_reference(state)),
         }
         for result in results
     ]
-    conclusion = _deterministic_report_conclusion(results, topic)
+    conclusion = _deterministic_report_conclusion(results, language_reference(state))
     conflicts = [
         item for item in state.get("claim_conflicts", []) if item.get("material")
     ]
     if conflicts:
         claims_by_id = _claim_index(results)
-        chinese = _uses_chinese(topic)
+        chinese = _uses_chinese(language_reference(state))
         conflict_lines = []
         for conflict in conflicts:
             left = claims_by_id.get(conflict["left_claim_id"], {})
@@ -4843,7 +4880,7 @@ def build_safe_report(state: OverallState, config: RunnableConfig):
                 "content": "\n\n".join(conflict_lines),
             }
         )
-    report = _assemble_sectioned_report(topic, overview, sections, conclusion)
+    report = _assemble_sectioned_report(language_reference(state), overview, sections, conclusion)
     analysis_complete = state.get("consistency_analysis_complete", True)
     consistency_audit = ReportConsistencyAudit(
         passes=analysis_complete,
@@ -4930,6 +4967,7 @@ def _revise_sectioned_report(
     report_plan = state.get("report_plan") or _fallback_report_plan(
         current_results, research_topic
     )
+    report_plan = {**report_plan, "language_reference": language_reference(state)}
     results_by_id = {result["dimension"]["id"]: result for result in current_results}
     revised_sections = []
     for section in state.get("report_sections", []):
@@ -4943,7 +4981,8 @@ def _revise_sectioned_report(
             max_claims_per_dimension=max(1, len(result.get("claims", []))),
             max_evidence_chars=160,
         )
-        prompt = report_section_revision_instructions.format(
+        prompt = format_research_prompt(
+            report_section_revision_instructions, language_context=state,
             research_topic=research_topic,
             dimension_title=dimension["title"],
             dimension_scope=dimension["scope"],
@@ -4974,7 +5013,8 @@ def _revise_sectioned_report(
         current_results, max_claims_per_dimension=3, max_evidence_chars=100
     )
     current_overview = state.get("report_overview", "")
-    overview_prompt = report_overview_revision_instructions.format(
+    overview_prompt = format_research_prompt(
+        report_overview_revision_instructions, language_context=state,
         research_topic=research_topic,
         report_plan=json.dumps(report_plan, ensure_ascii=False),
         dimension_research=overview_material,
@@ -4989,13 +5029,14 @@ def _revise_sectioned_report(
     revised_overview = _bounded_report_part_revision(
         prompt=overview_prompt,
         fallback=current_overview
-        or _deterministic_report_overview(current_results, research_topic),
+        or _deterministic_report_overview(current_results, language_reference(state)),
         model=model,
         research_run_id=research_run_id,
         event_prefix="report_overview_revision",
     )
     current_conclusion = state.get("report_conclusion", "")
-    conclusion_prompt = report_conclusion_revision_instructions.format(
+    conclusion_prompt = format_research_prompt(
+        report_conclusion_revision_instructions, language_context=state,
         research_topic=research_topic,
         report_plan=json.dumps(report_plan, ensure_ascii=False),
         dimension_research=overview_material,
@@ -5005,13 +5046,13 @@ def _revise_sectioned_report(
     revised_conclusion = _bounded_report_part_revision(
         prompt=conclusion_prompt,
         fallback=current_conclusion
-        or _deterministic_report_conclusion(current_results, research_topic),
+        or _deterministic_report_conclusion(current_results, language_reference(state)),
         model=model,
         research_run_id=research_run_id,
         event_prefix="report_conclusion_revision",
     )
     revised_report = _assemble_sectioned_report(
-        research_topic, revised_overview, revised_sections, revised_conclusion
+        language_reference(state), revised_overview, revised_sections, revised_conclusion
     )
     emit_research_event(
         "report_sections_revised",
@@ -5041,7 +5082,8 @@ def revise_report(state: OverallState, config: RunnableConfig):
     material = format_dimension_results(
         current_results, max_claims_per_dimension=5, max_evidence_chars=120
     )
-    prompt = report_revision_instructions.format(
+    prompt = format_research_prompt(
+        report_revision_instructions, language_context=state,
         research_topic=state["normalized_research_topic"],
         report_plan=json.dumps(
             state.get("report_plan")
