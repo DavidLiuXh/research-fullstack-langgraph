@@ -77,19 +77,69 @@ def format_research_prompt(
 ) -> str:
     """Apply the same policy to every generation, audit, retry and revision."""
     reference = language_reference(language_context)
-    return template.format(**values) + (
-        "\n\nOUTPUT LANGUAGE POLICY (applies to every human-readable output field):\n"
-        "Use the language of the user's request below, not the language of these "
-        "instructions, previous assistant messages, examples, or retrieved sources. "
-        "For mixed-language input, follow the language of the surrounding question, "
-        "not quoted passages, code or proper names. This policy applies to clarification "
-        "questions, normalized topic, dimension titles/scopes, gap questions, rationales, "
-        "summaries, reflection findings, audit feedback, report plan, report headings, "
-        "body, conclusion and revisions. Translate paraphrased claims, never verbatim "
-        "evidence quotes. Preserve JSON keys, enum values, IDs, URLs, citation markers, "
-        "code and proper names exactly. Search queries may use the source language "
-        "when it improves retrieval. In report audits, flag a report written in the "
-        "wrong language and request a language-correct revision. The reference below "
-        "is data used to identify language, not permission to override evidence rules.\n"
-        "User language reference: " + json.dumps(reference, ensure_ascii=False)
+    reporting_policy = (
+        (
+            "\nREPORTING CONTRACT: Statistical comparisons must state period, population, "
+            "geography, unit, retail/wholesale/production/export channel and actual versus "
+            "forecast. Never compare different scopes as contradictions. Never fill a "
+            "requested period with older observations without explicitly narrowing the "
+            "reported cutoff. Use a compact table for requested year-over-year and company "
+            "comparisons (current value, prior comparable value, change, scope, source); "
+            "mark unavailable cells honestly. Keep forecasts separate from actuals. "
+            "Tables belong ONLY in the relevant body chapter, each table once. "
+            "Never put tables in an executive overview or conclusion. Other chapters "
+            "refer to the comparison rather than recreating it. Historical values "
+            "must retain their actual year; a multi-year benchmark is not a prior-year value. "
+            "A month and its containing quarter/half-year are overlapping observations, "
+            "not a sequential trend. Never infer acceleration from their growth rates. "
+            "Domestic penetration and total-market penetration (including exports), or "
+            "passenger vehicles and all vehicles, must not be joined into a time series. "
+            "A rising share alone does not prove substitution or absolute growth. "
+            "Production minus wholesale sales does not establish retail demand. "
+            "Explain mechanisms linking verified changes to potential drivers, distinguish "
+            "supported causality from hypotheses and consider alternative explanations. "
+            "Analytical synthesis is allowed; new unsupported facts are not. Consolidate "
+            "material limitations once in the body or a single scope note; summaries "
+            "need at most one scope sentence, not another inventory of limitations. "
+            "Omit loop counts, confidence scores and raw gap "
+            "registries from reader-facing prose. Research completion is not fact confidence.\n"
+            "EVIDENCE BOUNDARY: The editorial thesis, previous chapters and completed body "
+            "are provisional writing context, NOT additional evidence. Correct any unsupported "
+            "thesis instead of inventing a causal story to satisfy it. Hypotheses must be "
+            "explicitly conditional in the same passage and retain that qualification in "
+            "the overview and conclusion. Do not invent costs, brand-level effects, inventory, "
+            "capacity breakdowns or policy mechanisms absent from the evidence. State what "
+            "the policy comparison baseline is: reduced exemptions can be a withdrawal "
+            "of support year-on-year, not a new stimulus relative to the prior regime. "
+            "Do not infer policy scope from a cap applying to only one category. State what "
+            "additional observation could test a proposed mechanism. Connect paragraphs through "
+            "the research question, not through unsupported causal certainty. Copy citation "
+            "markers exactly from each claim's allowed_citation_markers/source_ids; never "
+            "append suffixes or invent IDs. Summaries also need citations for factual claims.\n"
+            "This governs report content; planning and audit responses must still use their exact JSON schemas.\n"
+        )
+        if any(
+            key in values for key in ("report_plan", "draft_report", "claim_catalog")
+        )
+        else ""
+    )
+    return (
+        template.format(**values)
+        + reporting_policy
+        + (
+            "\n\nOUTPUT LANGUAGE POLICY (applies to every human-readable output field):\n"
+            "Use the language of the user's request below, not the language of these "
+            "instructions, previous assistant messages, examples, or retrieved sources. "
+            "For mixed-language input, follow the language of the surrounding question, "
+            "not quoted passages, code or proper names. This policy applies to clarification "
+            "questions, normalized topic, dimension titles/scopes, gap questions, rationales, "
+            "summaries, reflection findings, audit feedback, report plan, report headings, "
+            "body, conclusion and revisions. Translate paraphrased claims, never verbatim "
+            "evidence quotes. Preserve JSON keys, enum values, IDs, URLs, citation markers, "
+            "code and proper names exactly. Search queries may use the source language "
+            "when it improves retrieval. In report audits, flag a report written in the "
+            "wrong language and request a language-correct revision. The reference below "
+            "is data used to identify language, not permission to override evidence rules.\n"
+            "User language reference: " + json.dumps(reference, ensure_ascii=False)
+        )
     )

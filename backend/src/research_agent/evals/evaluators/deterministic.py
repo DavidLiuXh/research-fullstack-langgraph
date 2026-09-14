@@ -256,6 +256,8 @@ def evaluate_deterministic_quality(
         len(bullet_lines), len(body_lines), empty=0.0
     )
     article_coherence = (prose_score + enumeration_score) / 2
+    if outputs.get("report_generation_mode") == "safe_fallback":
+        article_coherence = 0.0  # A partial evidence inventory is not a complete article.
     material_conflicts = [
         conflict
         for conflict in outputs.get("claim_conflicts", [])

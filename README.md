@@ -45,6 +45,12 @@ falls back to English. Obvious Chinese/English report-language mismatches trigge
 revision. Verbatim evidence quotes, citation IDs, URLs and schema enums remain
 unchanged; search queries may use another language to retrieve better sources.
 
+Statistical requests whose explicit cumulative period has not ended (for example,
+January–September requested on September 13) pause for a scope decision before
+research: use the latest published complete period, or separate actuals from
+forecasts. Publication availability is checked during research even after a period
+has ended; unobserved months must never be presented as actual results.
+
 Additional frontend improvements include topic clarification and dimension
 review dialogs, readable dark-theme controls, an auto-scrolling activity
 timeline, configurable API URL, explicit loading and error states, and safe
@@ -94,29 +100,40 @@ the current implementation.
 9. **Plan the report narrative.** DeepSeek builds a validated editorial plan
    containing the central thesis, narrative strategy, section order, claim
    allocation, transitions, conclusion direction, and a consolidated approach
-   to limitations. Unknown dimensions and claim IDs are removed, while every
-   audited claim and dimension is deterministically restored if omitted.
+   to limitations. Reader-facing chapters may combine evidence across research
+   dimensions and omit secondary facts. Unknown claim IDs are removed; omitted
+   claims remain in the evidence ledger for audit rather than being forced into prose.
 10. **Draft the report.** The sanitized claims and conflict ledger are
    synthesized according to the shared plan. Long reports retain bounded
    section generation, but every section receives the global thesis, its own
-   argumentative role, and continuity context from the preceding section. A
-   separate cross-dimension conclusion is generated before deterministic
-   assembly.
+   argumentative role, preceding prose and previously used claim IDs. The summary
+   and conclusion read the completed body and its evidence. Statistical reports
+   must distinguish cutoff periods, retail/wholesale, production, exports,
+   populations, actuals and forecasts, with comparable year-over-year tables.
 11. **Audit and revise.** The normal report audit checks coverage, factual
     support, citations, uncertainty, counterarguments, thesis, paragraph
     development, transitions, repetition, and conclusion quality. Deterministic
     checks reject drafts dominated by enumerated claim fragments or repetitive
     evidence disclaimers unless the user explicitly requested a list. A separate
     consistency audit checks conflict disclosure and report-introduced
-    contradictions. Deterministic checks independently require both sides'
+    contradictions. Final report audits use the configured answer model with
+    reasoning enabled, independently of the drafting conversation; lightweight
+    dimension reflection still uses its own model. Audit feedback is bounded to
+    material, actionable issues. Bounded section revisions use low-effort reasoning
+    and can consult the global accepted evidence to resolve cross-chapter findings;
+    this adds latency compared with lightweight drafting. Deterministic checks
+    independently require both sides'
     citations and the conflict ID, so a model cannot incorrectly pass a silent
-    contradiction. Failed audits return to bounded revision.
-12. **Use a safe fallback when needed.** If the audit still fails after the
-    revision budget is exhausted, the graph builds citation-safe prose
-    paragraphs, an overview, a conclusion, and explicit treatment of both sides
-    of material unresolved conflicts from the sanitized claim ledger. An
-    unaudited model draft is never published merely because the retry limit was
-    reached.
+    contradiction. Failed audits return to bounded revision. Audits can target the
+    overview, conclusion or specific body chapters; unaffected parts are preserved
+    verbatim. Body changes also refresh the overview and conclusion. Missing or
+    invalid targets, or additional global checks, conservatively trigger a full revision.
+12. **Preserve fact-checked writing.** Factual safety is audited separately from
+    coverage and prose quality. After bounded revisions, retain a draft that
+    passed factual and consistency checks, even if editorial improvements remain.
+    When no such draft exists, return an explicitly labelled partial evidence
+    inventory with material conflicts, not a synthetic executive summary and
+    conclusion assembled from arbitrary first/last claims.
 13. **Finalize the answer.** The final node renders citations from report-ledger
     sources only and publishes either an audited report or the deterministic
     safe fallback.

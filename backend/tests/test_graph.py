@@ -2505,7 +2505,7 @@ def test_report_length_fallback_uses_request_language(monkeypatch):
     assert "## 结论" in result["report_draft"]
     assert "[S0-0]" in result["report_draft"]
     safe = build_safe_report(state, {})
-    assert safe["report_draft"].startswith("# 调研报告")
+    assert safe["report_draft"].startswith("# 阶段性证据整理")
 
 
 def test_language_reference_is_sent_to_every_dimension():
@@ -3086,7 +3086,7 @@ def test_detect_claim_conflicts_builds_validated_material_ledger(monkeypatch):
     ]
 
 
-def test_report_plan_normalizes_sections_and_preserves_every_claim(monkeypatch):
+def test_report_plan_selects_global_claims_without_forcing_every_claim(monkeypatch):
     graph_module = importlib.import_module("research_agent.graph")
 
     class PlanningModel:
@@ -3131,9 +3131,9 @@ def test_report_plan_normalizes_sections_and_preserves_every_claim(monkeypatch):
     result = generate_report_plan({**state, **prepared, "claim_conflicts": []}, {})
 
     plan = result["report_plan"]
-    assert [section["dimension_id"] for section in plan["sections"]] == ["1", "0"]
-    assert plan["sections"][0]["claim_ids"] == ["C-1-2", "C-1-1"]
-    assert plan["sections"][1]["claim_ids"] == ["C-0-1", "C-0-2"]
+    assert [section["dimension_id"] for section in plan["sections"]] == ["1"]
+    assert plan["sections"][0]["claim_ids"] == ["C-0-1", "C-1-2"]
+    assert plan["unallocated_claim_ids"] == ["C-0-2", "C-1-1"]
 
 
 def test_report_plan_has_deterministic_fallback_on_structured_failure(monkeypatch):
