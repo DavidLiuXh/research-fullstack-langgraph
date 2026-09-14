@@ -474,8 +474,10 @@ class ClaimExtraction(BaseModel):
 
 class ReportAudit(BaseModel):
     passes: bool
+    factual_passes: bool | None = Field(default=None, description="True only when facts, citations and statistical comparisons are safe, independently of writing quality and completeness.")
     issues: list[str] = Field(default_factory=list)
     revision_instructions: list[str] = Field(default_factory=list)
+    revision_targets: list[str] = Field(default_factory=list, description="Affected report parts only: overview, conclusion, or body:<chapter dimension_id>. Empty means whole report.")
 
     @model_validator(mode="before")
     @classmethod
@@ -508,8 +510,10 @@ class ReportAudit(BaseModel):
         if "passes" in raw:
             return raw
         normalized = dict(raw)
-        normalized["passes"] = bool(raw.get("pass", False))
+        # Let Pydantic parse booleans: bool("false") would silently pass an audit.
+        normalized["passes"] = raw.get("pass", False)
         normalized["issues"] = [
+            *render_findings(raw.get("issues"), "issue", "statement"),
             *render_findings(
                 raw.get("factual_statements_without_support"), "statement", "claim"
             ),
@@ -521,7 +525,12 @@ class ReportAudit(BaseModel):
             *render_findings(raw.get("structure_duplication_clarity"), "issue"),
         ]
         normalized["revision_instructions"] = [
-            str(item) for item in raw.get("required_corrections", []) if item
+            str(item)
+            for item in [
+                *raw.get("revision_instructions", []),
+                *raw.get("required_corrections", []),
+            ]
+            if item
         ]
         if raw.get("draft_answers_material_parts") is False:
             normalized["issues"] = [
@@ -537,6 +546,8 @@ class ReportAudit(BaseModel):
     @model_validator(mode="after")
     def validate_pass_status(self):
         """Prevent a passing audit from carrying material findings."""
+        if self.passes and self.factual_passes is False:
+            raise ValueError("A report with factual failures cannot pass")
         if self.passes and self.issues:
             raise ValueError("A passing report audit cannot contain findings")
         if not self.passes and not self.revision_instructions:
@@ -548,6 +559,7 @@ class ReportSectionPlan(BaseModel):
     """Editorial purpose and claim allocation for one report section."""
 
     dimension_id: str
+    title: str = ""
     objective: str
     synthesis_direction: str
     claim_ids: list[str] = Field(default_factory=list)

@@ -126,6 +126,8 @@ class OverallState(TypedDict):
     max_dimension_reflections: NotRequired[int]
     reasoning_model: str
     report_draft: str
+    last_fact_checked_report: NotRequired[str]
+    last_fact_checked_snapshot: NotRequired[dict]
     report_plan: NotRequired[dict]
     report_generation_mode: str
     report_overview: str

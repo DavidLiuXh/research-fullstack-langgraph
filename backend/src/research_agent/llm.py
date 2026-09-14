@@ -11,6 +11,7 @@ def create_deepseek_model(
     *,
     temperature: float = 0,
     thinking: bool = False,
+    reasoning_effort: str | None = None,
     max_retries: int = 4,
     timeout: float = 180,
 ) -> ChatDeepSeek:
@@ -27,4 +28,5 @@ def create_deepseek_model(
         max_retries=max_retries,
         timeout=timeout,
         extra_body={"thinking": {"type": "enabled" if thinking else "disabled"}},
+        **({"reasoning_effort": reasoning_effort} if reasoning_effort else {}),
     )

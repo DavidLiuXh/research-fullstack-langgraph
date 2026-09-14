@@ -428,6 +428,18 @@ export default function App() {
           };
           hasFinalizeEventOccurredRef.current = true;
           break;
+        case "fact_checked_report_retained":
+          processedEvent = {
+            title: t("Fact-checked Report Retained"),
+            data: t("The report passed factual review; remaining editorial limitations did not replace its prose."),
+          };
+          break;
+        case "safe_report_built":
+          processedEvent = {
+            title: t("Partial Evidence Only"),
+            data: t("A complete report did not pass factual review. The output is explicitly labelled as partial evidence."),
+          };
+          break;
       }
       if (processedEvent) {
         processedEvent.language = detectUiLanguage(languageReferenceRef.current);

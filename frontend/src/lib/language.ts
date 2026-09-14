@@ -11,6 +11,10 @@ export function detectUiLanguage(text: string): UiLanguage {
 }
 
 const chineseCopy: Record<string, string> = {
+  "Fact-checked Report Retained": "保留已通过事实审查的报告",
+  "The report passed factual review; remaining editorial limitations did not replace its prose.": "报告已通过事实审查，仍有编辑层面的不足，已保留完整正文。",
+  "Partial Evidence Only": "仅形成阶段性证据整理",
+  "A complete report did not pass factual review. The output is explicitly labelled as partial evidence.": "尚未形成通过事实审查的完整报告，输出已明确标注为阶段性证据整理。",
   "Planning Research Dimensions": "规划调研维度",
   "Research dimensions created": "已生成调研维度",
   "Generating Search Queries": "生成搜索查询",
